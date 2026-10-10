@@ -7,22 +7,74 @@ Each request runs under the requesting profile's scope, so the Desktop half driv
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
-# This file is imported on its own (no package), so load the shared module by path.
+# This file is imported on its own (no package), so load the plugin folder as a package, the way
+# Hermes does, for the shared modules' relative imports.
+_PLUGIN = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
-    "adaptiq_core_for_desktop", Path(__file__).resolve().parent.parent / "adaptiq_core.py")
-core = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(core)
+    "adaptiq_plugin_for_desktop", _PLUGIN / "__init__.py", submodule_search_locations=[str(_PLUGIN)])
+_plugin = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _plugin
+try:
+    _spec.loader.exec_module(_plugin)
+except Exception:
+    # A half-made module must not stay registered for the next import to find.
+    sys.modules.pop(_spec.name, None)
+    raise
+core = _plugin.core
 
 router = APIRouter()
+
+
+def _state():
+    """The plugin's own state in the requesting profile: the file the agent half keeps choices in."""
+    from hermes_cli.plugins_state import PluginState
+
+    return PluginState("adaptiq")
 
 
 @router.get("/status")
 def status() -> dict:
     return core.status()
+
+
+@router.get("/account")
+def account() -> dict:
+    """The settings page: workspace, memory and models, or only whether it is connected."""
+    summary = core.account_summary()
+    if summary is None:
+        return {"signed_in": core.status()["signed_in"], "account": None, "console": _plugin.knowledge.console_link()}
+    return {"signed_in": True, "account": _plugin.account.view(summary, main=core.main_model()),
+            "console": _plugin.knowledge.console_link()}
+
+
+def _session(value) -> str:
+    """A Hermes session id, or a 400: anything else would only fill the plugin's state."""
+    session = value if isinstance(value, str) else ""
+    if not _plugin.SESSION_ID.fullmatch(session):
+        raise HTTPException(status_code=400, detail="Name the conversation by its Hermes session id.")
+    return session
+
+
+@router.get("/conversation")
+def conversation(session: str) -> dict:
+    """Whether new messages of one Hermes conversation are saved to AdaptiqAI memory."""
+    session = _session(session)
+    return {"session": session, "saving": _plugin._remember(_state(), session)}
+
+
+@router.post("/conversation")
+def set_conversation(body: dict) -> dict:
+    session = _session(body.get("session"))
+    # "false" is not false: only a real boolean changes the choice.
+    if not isinstance(body.get("saving"), bool):
+        raise HTTPException(status_code=400, detail="Say saving as true or false.")
+    _plugin._set_remember(_state(), session, body["saving"])
+    return {"session": session, "saving": _plugin._remember(_state(), session)}
 
 
 @router.post("/login/start")

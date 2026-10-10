@@ -1,8 +1,8 @@
 {
   "name": "adaptiq",
   "label": "AdaptiqAI",
-  "description": "Sign-in routes for the AdaptiqAI Desktop page",
-  "version": "0.1.0",
+  "description": "Sign-in, account and conversation routes for the AdaptiqAI Desktop page",
+  "version": "0.2.0",
   "tab": { "hidden": true },
   "api": "plugin_api.py"
 }
