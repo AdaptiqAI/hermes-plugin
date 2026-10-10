@@ -1,0 +1,11 @@
+name: adaptiq
+kind: standalone
+version: 0.1.0
+manifest_version: 2
+description: AdaptiqAI - sign in once in the browser, no key to paste, and use your workspace's models.
+author: AdaptiqAI
+homepage: https://adaptiqai.com
+license: MIT
+requires_hermes: ">=0.21.6"
+provides_tools: []
+provides_hooks: []
