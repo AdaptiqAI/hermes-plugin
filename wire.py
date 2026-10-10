@@ -44,6 +44,13 @@ class Turn:
     remember: bool
     # Whether AdaptiqAI stores the conversation; looked up once, for a private turn only.
     stored: bool | None = None
+    # The AdaptiqAI conversation, when it is not the Hermes session: a compaction that continues in a
+    # new session id stays in the memory of the conversation it continues.
+    conversation: str = ""
+
+    @property
+    def memory_id(self) -> str:
+        return self.conversation or self.session_id
 
 
 class Turns:
@@ -82,7 +89,7 @@ def shape(request: dict, turn: Turn | None) -> dict:
     if turn is None:
         body[MEMORY_FIELD] = ephemeral("fork")
     else:
-        headers[SESSION_HEADER] = turn.session_id
+        headers[SESSION_HEADER] = turn.memory_id
         if turn.remember:
             # The provider entry marks every request ephemeral for the helper calls; a turn that is
             # remembered sends no memory mode, which saves it.

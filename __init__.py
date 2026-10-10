@@ -117,7 +117,7 @@ def _status_text(conversation: str | None = None) -> str:
     summary = core.account_summary()
     if summary is not None:
         return account.status_text(summary, conversation=conversation, main=synced.get("main"),
-                                   moved_from=synced.get("moved_from"))
+                                   moved_from=synced.get("moved_from"), sleep=core.session_memory())
     # A gateway without the summary, or a connection that may not read it.
     try:
         connection = core.status()
@@ -157,10 +157,54 @@ def _sessions_db():
     return _session_db
 
 
+# Compaction continuations already traced to the conversation they continue; that never changes.
+_roots: OrderedDict[str, str] = OrderedDict()
+
+
+def _conversation(session_id: str) -> str:
+    """The AdaptiqAI conversation a Hermes session belongs to: the session its compactions started from.
+
+    Hermes compacts in place by default, keeping the session id. Where it rotates instead
+    (`compression.in_place: false`, or an older Hermes), the continuation gets a new id; sent as it is,
+    that would start a second AdaptiqAI memory beside the first and grow both. A subagent, or a branch,
+    is a conversation of its own. Without the session store, a session is its own conversation.
+    """
+    if not session_id or session_id in _subagents:
+        return session_id
+    known = _roots.get(session_id)
+    if known is not None:
+        return known
+    db = _sessions_db()
+    if db is None:
+        return session_id
+    root = session_id
+    try:
+        if hasattr(db, "get_compression_lineage"):  # Hermes' own walk, which knows forks from continuations
+            lineage = db.get_compression_lineage(session_id) or [session_id]
+            root = str(lineage[0])
+        else:
+            seen = {session_id}
+            for _ in range(LINEAGE_DEPTH):
+                row = db.get_session(root) or {}
+                parent_id = row.get("parent_session_id") if isinstance(row, dict) else None
+                parent = db.get_session(parent_id) if parent_id and parent_id not in seen else None
+                if not isinstance(parent, dict) or parent.get("end_reason") != "compression":
+                    break
+                seen.add(parent_id)
+                root = parent_id
+    except Exception:  # a store that can't answer: the session stays its own conversation
+        return session_id
+    if root != session_id:
+        _roots[session_id] = root
+        while len(_roots) > KEEP_SESSIONS:
+            _roots.popitem(last=False)
+    return root
+
+
 def _ancestors(session_id: str, parent_session_id: str = "") -> list[str]:
     """The conversations this one continues, nearest first.
 
-    Hermes gives a conversation a new session id when it compacts it, and runs a subagent under
+    Hermes gives a conversation a new session id when it compacts it by rotation, and runs a subagent under
     one of its own. The hook names a subagent's parent; the session store keeps the chain a
     compaction leaves, which the hook does not follow.
     """
@@ -253,12 +297,12 @@ def _knowledge_text() -> str:
     if not session:
         return "Open a conversation first."
     try:
-        view = knowledge.conversation_view(session, _models.get(session))
+        view = knowledge.conversation_view(_conversation(session), _models.get(session))
     except knowledge.KnowledgeError as error:
         return str(error)
     if not view["knowledge"]:
         return ("No knowledge is used in this conversation. Ask the agent to find and attach a collection, "
-                f"or open AdaptiqAI Knowledge: {knowledge.console_link(session)}")
+                f"or open AdaptiqAI Knowledge: {knowledge.console_link(_conversation(session))}")
     return "\n".join(["Knowledge in this conversation:",
                       *(f"• {item['name']} — {item['status']}" for item in view["knowledge"])])
 
@@ -470,7 +514,7 @@ def _attach_ready(state, session_id: str) -> None:
         try:
             readiness = knowledge.readiness(memory_id, entry.get("model"), timeout=ATTACH_TIMEOUT)
             if readiness == "ready":
-                knowledge.use(session_id, entry.get("model"), memory_id, True)
+                knowledge.use(_conversation(session_id), entry.get("model"), memory_id, True)
             if readiness in ("ready", "failed"):
                 done.add(memory_id)
             else:
@@ -500,7 +544,10 @@ def _request_hooks(state):
     def on_turn(session_id: str = "", turn_id: str = "", parent_session_id: str = "",
                 user_message=None, conversation_history=None, **_) -> None:
         if session_id and turn_id:
-            _turns.note(turn_id, wire.Turn(session_id, _remember(state, session_id, parent_session_id or "")))
+            # A subagent, named by its parent, is a conversation of its own; a compaction is not.
+            conversation = session_id if parent_session_id else _conversation(session_id)
+            _turns.note(turn_id, wire.Turn(session_id, _remember(state, session_id, parent_session_id or ""),
+                                           conversation=conversation if conversation != session_id else ""))
         # A subagent's "user" is another agent: announced by subagent_start, or named by its parent.
         if session_id and session_id not in _subagents and not parent_session_id:
             history = [_text_of(message) for message in conversation_history or [] if _persons(message)]
@@ -529,7 +576,7 @@ def _request_hooks(state):
             if own is not None and own != turn.remember:
                 turn.remember, turn.stored = own, None
             if not turn.remember and turn.stored is None:
-                turn.stored = core.session_stored(turn.session_id, model)
+                turn.stored = core.session_stored(turn.memory_id, model)
         return {"request": wire.shape(request, turn), "source": "adaptiq",
                 "reason": "a turn of a conversation" if turn else "not a turn of a conversation: ephemeral"}
 
@@ -574,7 +621,9 @@ def _on_api_error(model: str = "", status_code: int | None = None, error_body=No
     """Hermes' recovery and wording for a failed request to AdaptiqAI (errors.py); None for others."""
     if not _failed_at_adaptiq(error, model):
         return None
-    return errors.classify(status_code, error_body, model)
+    # Only a full memory depends on the server: does it put idle conversations to sleep?
+    sleeps = errors.is_memory_full(status_code, error_body) and core.auto_sleep(model)
+    return errors.classify(status_code, error_body, model, auto_sleep=sleeps)
 
 
 def _on_subagent_start(child_session_id: str = "", **_) -> None:
@@ -618,7 +667,7 @@ def register(ctx) -> None:
     ctx.register_middleware("llm_request", on_request)
     knowledge_tool, memory_tool = tools.handlers(
         _models.get, lambda session: _remember(ctx.state, session),
-        lambda session, remember: _set_remember(ctx.state, session, remember))
+        lambda session, remember: _set_remember(ctx.state, session, remember), _conversation)
     ctx.register_tool("adaptiq_knowledge", tools.TOOLSET, tools.KNOWLEDGE, knowledge_tool, check_fn=tools.available,
                       description="Find and use AdaptiqAI Knowledge in this conversation")
     ctx.register_tool("adaptiq_memory", tools.TOOLSET, tools.MEMORY, memory_tool, check_fn=tools.available,

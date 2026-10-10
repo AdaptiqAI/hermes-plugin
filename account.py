@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import time
 
+CONSOLE = "https://memory.adaptiqai.com/memory"
+
 # Say when the connection ends once it is this close; sign-in makes a 90-day key.
 EXPIRY_NOTICE_DAYS = 14
 
@@ -60,10 +62,48 @@ def _model_line(model: dict, main: str | None) -> str:
 
 
 def _memory_text(memory: dict) -> str | None:
-    if not (memory.get("available") and _count(memory.get("limit_tokens"))):
+    if not (memory.get("available", True) and _count(memory.get("limit_tokens"))):
         return None
+    fraction = memory.get("fraction", memory.get("usage_ratio"))
+    if not isinstance(fraction, (int, float)):
+        fraction = (memory.get("used_tokens") or 0) / memory["limit_tokens"]
     return (f"{format_tokens(memory.get('used_tokens') or 0)} of {format_tokens(memory['limit_tokens'])} "
-            f"({format_percent(memory.get('fraction') or 0)})")
+            f"({format_percent(fraction)})")
+
+
+def _history(memory: dict) -> float | None:
+    """Session-history fullness, where the server reports it apart from the library."""
+    ratio = memory.get("session_usage_ratio")
+    if isinstance(ratio, (int, float)) and ratio >= 0:
+        return ratio
+    used, limit = _count(memory.get("session_tokens")), _count(memory.get("session_limit_tokens"))
+    return used / limit if used is not None and limit else None
+
+
+def sleep_lines(view: dict | None, console: str | None = None) -> list[str]:
+    """What `GET /v1/workspace/session-memory` says a person should know, in quiet lines.
+
+    Idle conversations sleep on their own to make room: compiled memory is dropped, the transcript
+    is kept, and they wake when used. Nothing is ever deleted automatically, so this asks for
+    nothing; only an ask-mode suggestion names where to decide.
+    """
+    if not isinstance(view, dict):
+        return []
+    lines = []
+    sleeping = sum(1 for row in view.get("sessions") or [] if isinstance(row, dict) and row.get("hibernated"))
+    if sleeping == 1:
+        lines.append("An idle conversation is sleeping to make room. Nothing is deleted; it wakes when you use it.")
+    elif sleeping > 1:
+        lines.append(f"{sleeping} idle conversations are sleeping to make room. Nothing is deleted; "
+                     "they wake when you use them.")
+    plan = view.get("plan") if isinstance(view.get("plan"), dict) else {}
+    candidates = [row for row in plan.get("candidates") or [] if isinstance(row, dict)]
+    if plan.get("state") == "suggest" and plan.get("mode", "ask") == "ask" and candidates:
+        ratio = plan.get("usage_ratio")
+        full = f"{format_percent(ratio)} full" if isinstance(ratio, (int, float)) else "almost full"
+        lines.append(f"Conversation memory is {full}. {len(candidates)} conversations you haven't used for a while "
+                     f"can sleep to make room. Nothing is deleted. Open the console: {console or CONSOLE}")
+    return lines
 
 
 def _ends(summary: dict, now: float | None) -> str | None:
@@ -85,18 +125,22 @@ def _name_of(summary: dict, model_id: str) -> str:
 
 
 def status_text(summary: dict, *, conversation: str | None = None, main: str | None = None,
-                moved_from: str | None = None, now: float | None = None) -> str:
+                moved_from: str | None = None, now: float | None = None, sleep: dict | None = None) -> str:
     """What `/adaptiq status` says: the essentials on the first line, then the models.
 
     `conversation` is "saved" or "private" inside a conversation, `main` the AdaptiqAI model Hermes
-    starts on, `moved_from` the main model that had no lanes any more.
+    starts on, `moved_from` the main model that had no lanes any more, `sleep` the session-memory view.
     """
     workspace = (summary.get("workspace") or {}).get("label") or "your workspace"
     first = [f"AdaptiqAI: connected to {workspace}"]
     if conversation:
         first.append(f"this conversation is {conversation}")
     memory = summary.get("memory") or {}
-    if _memory_text(memory):
+    if _memory_text(memory) and _history(memory) is not None:
+        # used/limit are the library; session history has its own budget beside it.
+        first.append(f"library {_memory_text(memory)}")
+        first.append(f"conversations {format_percent(_history(memory))}")
+    elif _memory_text(memory):
         first.append(f"memory {_memory_text(memory)}")
     lines = [" · ".join(first)]
     models = [model for model in summary.get("models") or [] if isinstance(model, dict)]
@@ -108,8 +152,10 @@ def status_text(summary: dict, *, conversation: str | None = None, main: str | N
         lines.append(f"Your main model was {_name_of(summary, moved_from)}, which has no lanes any more. "
                      f"It is {_name_of(summary, main)} now.")
     conversations, knowledge = _count(memory.get("conversations_tokens")), _count(memory.get("knowledge_tokens"))
-    if memory.get("available") and conversations is not None and knowledge is not None:
+    if memory.get("available") and conversations is not None and knowledge is not None and _history(memory) is None:
         lines.append(f"Memory split: conversations {format_tokens(conversations)}, knowledge {format_tokens(knowledge)}")
+    if _history(memory) is not None:  # only a server that reports history apart puts conversations to sleep
+        lines.extend(sleep_lines(sleep, (summary.get("links") or {}).get("console")))
     if _ends(summary, now):
         lines.append(f"This connection ends {_ends(summary, now)}. /adaptiq login renews it.")
     return "\n".join(lines)

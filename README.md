@@ -26,8 +26,9 @@ key to copy or paste. Each Hermes conversation keeps its own native memory on Ad
 
 - **Desktop:** Settings → AdaptiqAI → Sign in again, or "AdaptiqAI: Sign in" in the command
   palette.
-- **Any chat:** `/adaptiq`, or `/adaptiq status`. Status shows the workspace, memory use, each model
-  with its lanes and how many run now, and, in its last two weeks, when the connection ends.
+- **Any chat:** `/adaptiq`, or `/adaptiq status`. Status shows the workspace, library and conversation-history use, each model
+  with its lanes and how many run now, and, in its last two weeks, when the connection ends. Where AdaptiqAI puts idle conversations to sleep to
+  make room, one line says so; in ask mode, a suggestion gives the console link.
 - **Terminal:** `hermes adaptiq login`, or `hermes adaptiq status`.
 
 A connection lasts 90 days. You can see it in the console under **API keys**, as
@@ -50,6 +51,20 @@ model has no lanes, the new model becomes the main model.
 
 Every turn of a Hermes conversation tells AdaptiqAI which conversation it belongs to, using Hermes'
 own session id. So AdaptiqAI keeps that conversation's memory, under the same id when you resume it.
+
+AdaptiqAI keeps the whole conversation, so it never needs compacting. Hermes has no way for a plugin to
+decline compaction for one provider, so the plugin does two things:
+
+- **Compaction only when the conversation no longer fits.** Hermes compacts AdaptiqAI models only once
+  their input budget is full, where the request would not fit anyway. Other providers keep your
+  settings.
+- **One memory per conversation, compacted or not.** Hermes compacts in place by default and keeps the
+  session id. Where it starts a new session id instead (`compression.in_place: false`, or an older
+  Hermes), the continuation still uses the memory of the conversation it continues. It does not start
+  a second one beside it. A subagent keeps a conversation of its own.
+
+A `/compress` you run yourself still compacts. AdaptiqAI then rebuilds that conversation's memory from
+the shorter history, under the same conversation.
 
 Some requests are not a turn of a conversation and run once, saving nothing:
 
@@ -92,7 +107,11 @@ The plugin tells Hermes what AdaptiqAI's answers mean, so Hermes recovers the ri
   that you can pick another with `/model`. It no longer tells you to fix your API key.
 - **Memory full.** Hermes stops instead of retrying, and never compresses the conversation (AdaptiqAI
   keeps it whole). You can free up space in Knowledge, use another model, or continue with
-  `/adaptiq private`.
+  `/adaptiq private`. Where AdaptiqAI puts idle conversations to sleep to make room (their compiled
+  memory is dropped, the transcript is kept, and they wake when you use them; nothing is deleted),
+  a full memory means nothing idle could sleep, and Hermes says: "Memory is full and nothing idle
+  could sleep. Delete or unpin a conversation in the console, or add memory." A new conversation
+  frees nothing.
 - **All lanes busy, or a conversation being prepared.** Hermes retries by itself.
 - **Expired sign-in.** Hermes asks you to run `/adaptiq login`.
 
@@ -101,7 +120,7 @@ Hermes Desktop shows these in AdaptiqAI's own words.
 ## What it changes in Hermes
 
 - `ADAPTIQ_API_KEY` in Hermes' `.env`.
-- A `providers.adaptiq` entry pointing at `https://api.adaptiqai.com/v1`, with the key taken from
+- A `providers.AdaptiqAI` entry pointing at `https://api.adaptiqai.com/v1`, with the key taken from
   that variable. The model list is read live from the workspace, so a model rented later appears
   without signing in again.
 - The main model becomes the workspace model with the most lanes.
@@ -110,6 +129,9 @@ Hermes Desktop shows these in AdaptiqAI's own words.
   - A model rented later gets its context window.
   - A model whose lanes ended leaves the entry (the engine's own model stays listed without lanes, and is never made the main model).
   - If Hermes' main model was one of those, it moves to the model with the most lanes.
+- `compression.model_thresholds` gets `1.0` for each AdaptiqAI model that has no threshold of its
+  own, so Hermes compacts those conversations only when they no longer fit (see Memory per
+  conversation). A threshold you set yourself is kept.
 - The entry's `extra_body` marks requests to it as run-once (`adaptiq_native_memory`). Hermes' helper
   calls inherit that. The plugin takes it off each turn of a conversation, so those turns are saved.
 

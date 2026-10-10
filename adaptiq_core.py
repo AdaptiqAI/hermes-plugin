@@ -1,7 +1,7 @@
 """AdaptiqAI sign-in for Hermes, shared by the slash command, the CLI and the Desktop routes.
 
 Device flow (docs/HARNESS_PLUGINS.md in the gateway repo) -> key in Hermes' .env under
-ADAPTIQ_API_KEY -> a ``providers.adaptiq`` entry pointing at it through ``key_env`` -> the main
+ADAPTIQ_API_KEY -> a ``providers.AdaptiqAI`` entry pointing at it through ``key_env`` -> the main
 model on the workspace model with the most lanes. Stdlib only, so the plugin has no dependencies.
 """
 
@@ -142,6 +142,27 @@ def _in_step(entry: dict, rows: list[dict]) -> dict:
     return entry
 
 
+# Hermes compacts a conversation from a share of the model's window. AdaptiqAI keeps the whole
+# conversation in native memory, as the DeepSeek Harness plugin declines compaction to keep it whole;
+# Hermes has no per-provider way to decline, so its AdaptiqAI models compact only once the input
+# budget is full (`compression.model_thresholds`), where the request would not fit anyway.
+COMPACT_AT = 1.0
+
+
+def _compact_when_full(cfg: dict, model_ids) -> bool:
+    """Give each AdaptiqAI model the compact-when-full threshold, keeping one the person set.
+    Returns True when the config changed."""
+    compression = dict(cfg["compression"]) if isinstance(cfg.get("compression"), dict) else {}
+    thresholds = dict(compression["model_thresholds"]) if isinstance(compression.get("model_thresholds"), dict) else {}
+    missing = [model for model in model_ids if model and model not in thresholds]
+    if not missing:
+        return False
+    thresholds.update({model: COMPACT_AT for model in missing})
+    compression["model_thresholds"] = thresholds
+    cfg["compression"] = compression
+    return True
+
+
 def apply(token: str) -> tuple[str, list[str]]:
     """Store the key where Hermes keeps keys and point Hermes at the workspace's models.
 
@@ -175,6 +196,7 @@ def apply(token: str) -> tuple[str, list[str]]:
                       "api_mode": "chat_completions", "key_env": KEY_ENV})
         model.pop("api_key", None)
         cfg["model"] = model
+    _compact_when_full(cfg, entry["models"])
     save_config(cfg)
     return default, list(entry["models"])
 
@@ -207,7 +229,8 @@ def sync() -> dict:
     if model.get("provider") == name and model.get("default") not in entry["models"] and _main_model(rows):
         moved_from = model.get("default") or None
         model["default"] = _main_model(rows)
-    if entry != providers[name] or model != was:
+    compaction = _compact_when_full(cfg, entry["models"])
+    if entry != providers[name] or model != was or compaction:
         providers[name] = entry
         cfg["providers"] = providers
         if model != was:
@@ -310,6 +333,38 @@ def session_stored(session_id: str, model: str | None = None) -> bool:
     except (OSError, ValueError):  # unreachable, slow or not JSON: ephemeral is always safe
         return False
     return code == 200
+
+
+def session_memory() -> dict | None:
+    """`GET /v1/workspace/session-memory`: which conversations sleep and any ask-mode suggestion.
+    None without the `session_memory` scope, on an older gateway, or when it can't be reached."""
+    from hermes_cli.config import get_env_value
+
+    key = get_env_value(KEY_ENV)
+    if not key:
+        return None
+    try:
+        code, view = _call("GET", "/workspace/session-memory", key=key, timeout=5)
+    except Exception:  # unreachable, slow, cut short or not JSON: the status answers without it
+        return None
+    return view if code == 200 and isinstance(view, dict) else None
+
+
+def sleeps(memory) -> bool:
+    """Whether a server puts idle conversations to sleep: its memory reports session history apart."""
+    return isinstance(memory, dict) and isinstance(memory.get("session_limit_tokens"), (int, float))
+
+
+def auto_sleep(model: str) -> bool:
+    """Whether the server behind `model` puts idle conversations to sleep, from the account summary.
+    False when it can't be told: then a full memory keeps the shared-pool words."""
+    try:
+        summary = account_summary() or {}
+    except Exception:
+        return False
+    own = next((row.get("memory") for row in summary.get("models") or []
+                if isinstance(row, dict) and row.get("id") == model), None)
+    return sleeps(own if isinstance(own, dict) else summary.get("memory"))
 
 
 def status() -> dict:

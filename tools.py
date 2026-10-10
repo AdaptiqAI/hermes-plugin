@@ -52,9 +52,12 @@ KNOWLEDGE = {
 MEMORY = {
     "name": "adaptiq_memory",
     "description": (
-        "Help the user keep working with their AdaptiqAI shared memory. status reads the workspace allowance "
-        "across ALL conversations and collections (not per conversation) plus this conversation's size; when "
-        "discussing capacity, check it and proactively offer concrete options instead of technical instructions. "
+        "Help the user keep working with their AdaptiqAI shared memory. status reads the workspace memory, "
+        "not per conversation, plus this conversation's size. When usage.session_* is present, usage is the "
+        "library (collections) and session_* the conversation history, and idle conversations sleep on their own "
+        "to make room (nothing is deleted; they wake when used), so a filling history needs no action; only a full "
+        "library or a memory-full error does. Without it, usage is one allowance across ALL conversations and "
+        "collections. When discussing capacity, check it and proactively offer concrete options instead of technical instructions. "
         "inventory lists collections with logical size and date (sizes are not guaranteed reclaimable; age is not "
         "proof of disuse). review returns a link to AdaptiqAI Knowledge for the user to open and clean up there — "
         "never delete anything yourself. continue_without_saving is only for an explicit user choice: existing "
@@ -298,9 +301,10 @@ def available() -> bool:
             or (entry is not None and model.get("provider") == entry))
 
 
-def handlers(model_of, remember_of, set_remember):
+def handlers(model_of, remember_of, set_remember, conversation_of=lambda session: session):
     """The two tool handlers. `model_of(session)` is the model a conversation runs on; `remember_of` and
-    `set_remember` read and set whether its new messages are saved."""
+    `set_remember` read and set whether its new messages are saved; `conversation_of(session)` is the
+    AdaptiqAI conversation a Hermes session belongs to (the one a compaction continued)."""
 
     def run(work, session_id: str) -> str:
         if not session_id:
@@ -314,9 +318,10 @@ def handlers(model_of, remember_of, set_remember):
         action = args.get("action")
 
         def work(session: str, model: str | None) -> dict:
-            view = knowledge.conversation_view(session, model)
+            conversation = conversation_of(session)
+            view = knowledge.conversation_view(conversation, model)
             if action == "status":
-                result = {"conversation": session, "saving_enabled": remember_of(session),
+                result = {"conversation": conversation, "saving_enabled": remember_of(session),
                           "memory_tokens": view["memory_tokens"], "knowledge": view["knowledge"],
                           "conversations": view["conversations"]}
                 note = conversations_note(view["conversations"])
@@ -336,8 +341,8 @@ def handlers(model_of, remember_of, set_remember):
             attach = action == "attach"
             if (memory_id in selected) == attach:
                 return {"memory_id": memory_id, "changed": False, "selected": attach}
-            knowledge.use(session, model, memory_id, attach)
-            item = next((entry for entry in knowledge.conversation_view(session, model)["knowledge"]
+            knowledge.use(conversation, model, memory_id, attach)
+            item = next((entry for entry in knowledge.conversation_view(conversation, model)["knowledge"]
                          if entry["memory_id"] == memory_id), None)
             result = {"memory_id": memory_id, "changed": True, "selected": attach, "applies": "subsequent_model_calls"}
             if item is not None:
@@ -352,29 +357,43 @@ def handlers(model_of, remember_of, set_remember):
         action = args.get("action")
 
         def work(session: str, model: str | None) -> dict:
+            conversation = conversation_of(session)
             if action == "continue_without_saving":
                 set_remember(session, False)
                 return {"saving_new_messages": False, "existing_memory_preserved": True,
                         "applies": "subsequent_model_calls", "previous_request_replayed": False}
             if action == "review":
-                return {"url": knowledge.console_link(session), "opened": False,
+                return {"url": knowledge.console_link(conversation), "opened": False,
                         "note": "Give the user this link to review and clean up in AdaptiqAI Knowledge. "
                                 "Nothing was deleted or purchased."}
             if action == "status":
                 summary = core.account_summary() or {}
-                view = knowledge.conversation_view(session, model)
+                view = knowledge.conversation_view(conversation, model)
+                sleeps = core.sleeps(summary.get("memory"))
+                sleep = (core.session_memory() or {}) if sleeps else {}
+                history = {"conversation_history": {
+                    "sleeping": sum(1 for row in sleep.get("sessions") or []
+                                    if isinstance(row, dict) and row.get("hibernated")),
+                    "note": "Idle conversations sleep on their own to make room; nothing is deleted and they "
+                            "wake when used. A filling history needs no action.",
+                }} if sleeps else {}
                 return {
-                    "scope": "all_workspace_conversations_and_knowledge",
+                    # usage: where session_* is reported, used/limit_tokens are the library and session_* is
+                    # conversation history; otherwise one allowance across everything.
+                    "scope": "workspace_library_and_conversation_history" if sleeps
+                             else "all_workspace_conversations_and_knowledge",
                     "usage": summary.get("memory"),
+                    **history,
                     "this_conversation": {"memory_tokens": view["memory_tokens"], "saving_enabled": remember_of(session),
                                           "knowledge": len(view["knowledge"]),
                                           "attached_conversations": len(view["conversations"])},
                     "rules": {"new_conversation_frees_memory": False, "detach_frees_storage": False,
-                              "compact_frees_stored_memory": False, "automatic_deletion": False},
+                              "compact_frees_stored_memory": False, "automatic_deletion": False,
+                              "idle_conversations_sleep_automatically": sleeps},
                 }
             if action != "inventory":
                 raise knowledge.KnowledgeError("Use status, inventory, review or continue_without_saving.")
-            target = knowledge.conversation_view(session, model).get("model") or model
+            target = knowledge.conversation_view(conversation, model).get("model") or model
             if not target:
                 raise knowledge.KnowledgeError("Send a message on an AdaptiqAI model first.")
             page = knowledge.library(target, cursor=args.get("cursor"))

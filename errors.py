@@ -13,8 +13,15 @@ import re
 
 CONSOLE = "https://memory.adaptiqai.com/memory"
 
+# A server with one shared pool (no session history reported apart): nothing sleeps there.
 MEMORY_FULL = ("Your workspace memory is full, so this conversation can't save new messages. "
                "Free up space in AdaptiqAI Knowledge, or continue privately with /adaptiq private.")
+# Where idle conversations sleep on their own to make room, a 507 means none could. A new conversation
+# frees nothing, so it is never suggested.
+MEMORY_NO_ROOM = ("Memory is full and nothing idle could sleep. Delete or unpin a conversation in the console, "
+                  "or add memory.")
+MEMORY_FULL_LIBRARY = ("Your library is full. Remove a collection you no longer need in the console, "
+                       "or add memory.")
 SIGN_IN = "Your AdaptiqAI sign-in has expired. Run /adaptiq login to sign in again."
 NO_LANES = ("Your workspace has no lanes on {name} right now. Get lanes with /adaptiq models, or pick "
             "another model with /model.")
@@ -72,8 +79,16 @@ def server_detail(body) -> tuple[str, str, str]:
     return text(body.get("message")), text(body.get("type")), text(body.get("code"))
 
 
-def classify(status: int | None, body, model: str) -> dict | None:
-    """The verdict for Hermes' `transform_api_error_classification` hook, or None to leave it to Hermes."""
+def is_memory_full(status: int | None, body) -> bool:
+    message, kind, code = server_detail(body)
+    return status == 507 or "memory_capacity_exceeded" in f"{kind} {code} {message}".lower()
+
+
+def classify(status: int | None, body, model: str, auto_sleep: bool = False) -> dict | None:
+    """The verdict for Hermes' `transform_api_error_classification` hook, or None to leave it to Hermes.
+
+    `auto_sleep`: the server puts idle conversations to sleep (its usage reports session history apart).
+    """
     message, kind, code = server_detail(body)
     haystack = f"{kind} {code} {message}".lower()
 
@@ -87,8 +102,12 @@ def classify(status: int | None, body, model: str) -> dict | None:
     name = model_name(model) if model else "this model"
     if status == 507 or has("memory_capacity_exceeded"):
         # Another AdaptiqAI model keeps its own memory, so /model is a way on as well.
+        if not auto_sleep:
+            full = MEMORY_FULL
+        else:
+            full = MEMORY_FULL_LIBRARY if "library is full" in message.lower() else MEMORY_NO_ROOM
         return {"reason": "unknown", "retryable": False, "should_compress": False,
-                "should_rotate_credential": False, "should_fallback": False, "message": MEMORY_FULL}
+                "should_rotate_credential": False, "should_fallback": False, "message": full}
     if status == 401:
         # Hermes' own recovery for a refused key, with the way to a new one.
         return {"reason": "auth", "retryable": False, "should_rotate_credential": True, "should_fallback": True,
