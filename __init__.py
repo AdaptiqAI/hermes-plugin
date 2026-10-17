@@ -49,8 +49,9 @@ _sync_lock = threading.Lock()
 _models: dict[str, str] = {}
 # What the person wrote in each recent conversation, for the create-knowledge guard.
 _written = tools.Written()
-# Sessions Hermes started for subagents: their "user" messages are another agent's words.
-_subagents: OrderedDict[str, None] = OrderedDict()
+# Sessions Hermes started for subagents, with the session that started each when Hermes names it:
+# their "user" messages are another agent's words.
+_subagents: OrderedDict[str, str | None] = OrderedDict()
 # How often, and for how long, a new collection is checked before it is used in its conversation.
 ATTACH_CHECK_EVERY = 15
 ATTACH_FOLLOW_FOR = 2 * 3600
@@ -546,8 +547,12 @@ def _request_hooks(state):
         if session_id and turn_id:
             # A subagent, named by its parent, is a conversation of its own; a compaction is not.
             conversation = session_id if parent_session_id else _conversation(session_id)
+            # Hermes names a parent for delegated subagents only: each works for its parent, a helper.
+            # The parent is named by its AdaptiqAI conversation, which a rotated compaction keeps.
+            parent = parent_session_id or _subagents.get(session_id) or ""
             _turns.note(turn_id, wire.Turn(session_id, _remember(state, session_id, parent_session_id or ""),
-                                           conversation=conversation if conversation != session_id else ""))
+                                           conversation=conversation if conversation != session_id else "",
+                                           parent=_conversation(parent) if parent else ""))
         # A subagent's "user" is another agent: announced by subagent_start, or named by its parent.
         if session_id and session_id not in _subagents and not parent_session_id:
             history = [_text_of(message) for message in conversation_history or [] if _persons(message)]
@@ -626,9 +631,9 @@ def _on_api_error(model: str = "", status_code: int | None = None, error_body=No
     return errors.classify(status_code, error_body, model, auto_sleep=sleeps)
 
 
-def _on_subagent_start(child_session_id: str = "", **_) -> None:
+def _on_subagent_start(child_session_id: str = "", parent_session_id: str = "", **_) -> None:
     if child_session_id:
-        _subagents[child_session_id] = None
+        _subagents[child_session_id] = parent_session_id or None
         while len(_subagents) > KEEP_SESSIONS:
             _subagents.popitem(last=False)
 

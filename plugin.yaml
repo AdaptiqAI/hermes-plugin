@@ -1,6 +1,6 @@
 name: adaptiq
 kind: standalone
-version: 0.2.1
+version: 0.2.2
 manifest_version: 2
 description: AdaptiqAI - sign in once in the browser, no key to paste, and use your workspace's models.
 author: AdaptiqAI

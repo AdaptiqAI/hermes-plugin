@@ -11,6 +11,7 @@ nothing in memory:
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -22,6 +23,21 @@ SESSION_HEADER_ALIASES = frozenset({
     "x-thread-id", "x-openwebui-chat-id", "x-openwebui-conversation-id", "x-openwebui-session-id",
 })
 MEMORY_FIELD = "adaptiq_native_memory"
+# A subagent names the conversation that started it (core's relations.ts): `helper` works for it
+# inside the same task, `track` is a line of work of its own.
+PARENT_HEADER = "X-Adaptiq-Parent-Session-Id"
+ROLE_HEADER = "X-Adaptiq-Session-Role"
+RELATION_HEADERS = frozenset({PARENT_HEADER.lower(), ROLE_HEADER.lower()})
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+
+
+def relation_headers(session_id: str, parent: str, role: str = "helper") -> dict:
+    """The parent headers of a conversation's request; none for a root conversation, an invalid id
+    or a conversation naming itself, which are dropped rather than sent."""
+    if not (isinstance(session_id, str) and SESSION_ID.fullmatch(session_id)
+            and isinstance(parent, str) and SESSION_ID.fullmatch(parent)) or parent == session_id:
+        return {}
+    return {PARENT_HEADER: parent, ROLE_HEADER: "track" if role == "track" else "helper"}
 
 
 def ephemeral(kind: str) -> dict:
@@ -47,6 +63,10 @@ class Turn:
     # The AdaptiqAI conversation, when it is not the Hermes session: a compaction that continues in a
     # new session id stays in the memory of the conversation it continues.
     conversation: str = ""
+    # The AdaptiqAI conversation of the session that started this one (a subagent's parent), and how
+    # it relates to it.
+    parent: str = ""
+    role: str = "helper"
 
     @property
     def memory_id(self) -> str:
@@ -84,12 +104,13 @@ def shape(request: dict, turn: Turn | None) -> dict:
     """
     shaped = dict(request)
     headers = {name: value for name, value in (request.get("extra_headers") or {}).items()
-               if name.lower() not in SESSION_HEADER_ALIASES}
+               if name.lower() not in SESSION_HEADER_ALIASES and name.lower() not in RELATION_HEADERS}
     body = dict(request.get("extra_body") or {})
     if turn is None:
         body[MEMORY_FIELD] = ephemeral("fork")
     else:
         headers[SESSION_HEADER] = turn.memory_id
+        headers.update(relation_headers(turn.memory_id, turn.parent, turn.role))
         if turn.remember:
             # The provider entry marks every request ephemeral for the helper calls; a turn that is
             # remembered sends no memory mode, which saves it.

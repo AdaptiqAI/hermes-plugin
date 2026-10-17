@@ -62,6 +62,8 @@ decline compaction for one provider, so the plugin does two things:
   session id. Where it starts a new session id instead (`compression.in_place: false`, or an older
   Hermes), the continuation still uses the memory of the conversation it continues. It does not start
   a second one beside it. A subagent keeps a conversation of its own.
+- **Subagents shown under their conversation.** A subagent's requests name the conversation that
+  started it, so the AdaptiqAI console lists it there, as a helper.
 
 A `/compress` you run yourself still compacts. AdaptiqAI then rebuilds that conversation's memory from
 the shorter history, under the same conversation.

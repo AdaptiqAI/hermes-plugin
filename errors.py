@@ -23,18 +23,22 @@ MEMORY_NO_ROOM = ("Memory is full and nothing idle could sleep. Delete or unpin 
 MEMORY_FULL_LIBRARY = ("Your library is full. Remove a collection you no longer need in the console, "
                        "or add memory.")
 SIGN_IN = "Your AdaptiqAI sign-in has expired. Run /adaptiq login to sign in again."
-NO_LANES = ("Your workspace has no lanes on {name} right now. Get lanes with /adaptiq models, or pick "
-            "another model with /model.")
-# What older gateways said for every model without lanes. Newer ones name the model and where to
-# rent it, and that sentence is passed on.
+# No model is named: the models change all the time (Simon, 2026-10-15).
+NO_LANES = ("You need to rent a lane or subscribe to AdaptiqAI to continue. Get lanes with /adaptiq models, "
+            "or pick another model with /model.")
+# What older gateways said for every model without lanes. Newer ones say where to rent, and that
+# sentence is passed on.
 _UNNAMED = ("model access is required", "select an authorized model", "instance access is required")
 GET_HERE = "Or get lanes here with /adaptiq models."
+# What a payment ends, when the gateway says nothing of its own.
+PAUSED = "Your balance ran out, so your lanes are paused. Add funds in the AdaptiqAI console to continue."
+PLAN_USED_UP = "Your plan's usage is used up for now. Rent extra lanes with /adaptiq models in the meantime."
 BUSY = "All of your lanes on {name} are busy. Your request will retry automatically in a moment."
 # Types and codes only AdaptiqAI sends: an error that carries one is AdaptiqAI's even with no
 # status, as one raised inside a stream is.
 _OWN = ("adaptiq", "memory_capacity_exceeded", "inference_entitlement_required", "instance_access_required",
-        "lane_access", "rental_stopped_unused", "inflightlimit", "session_route_unavailable",
-        "conversation_preparing", "upload_capacity_exhausted")
+        "lane_access", "rental_stopped_unused", "rental_paused", "plan_usage_exhausted", "inflightlimit",
+        "session_route_unavailable", "conversation_preparing", "upload_capacity_exhausted")
 PREPARING = "AdaptiqAI is getting your conversation ready. It will retry automatically."
 CONVERSATION_BUSY = ("This conversation couldn't be opened on AdaptiqAI just now. It will retry "
                      "automatically; your saved memory is unchanged.")
@@ -115,14 +119,20 @@ def classify(status: int | None, body, model: str, auto_sleep: bool = False) -> 
     if code == "rental_stopped_unused":
         # The gateway says why and where to rent again.
         return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
-                "message": f"{message} {GET_HERE}" if message else NO_LANES.format(name=name)}
+                "message": f"{message} {GET_HERE}" if message else NO_LANES}
+    if code in ("rental_paused", "plan_usage_exhausted"):
+        # A payment ends these. Hermes takes a 402 for spent credit and benches the key for an hour,
+        # past the funds or the extra lanes that end it; model_not_found benches nothing and is not
+        # retried. The gateway says what to do, and until when.
+        return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
+                "message": message or (PAUSED if code == "rental_paused" else PLAN_USED_UP)}
     if (has("AdaptiqLaneAccessRequired", "inference_entitlement_required", "instance_access_required", "lane_access")
             or (status == 403 and has("lane", "entitle", "model access"))):
         # model_not_found, not model_entitlement: that one benches the key for the model, and a
         # rental started a minute later must work at once.
         said = message and not message.lower().startswith(_UNNAMED)
         return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
-                "message": f"{message} {GET_HERE}" if said else NO_LANES.format(name=name)}
+                "message": f"{message} {GET_HERE}" if said else NO_LANES}
     if status == 429 or has("AdaptiqLaneQueueTimeout", "InflightLimit"):
         # overloaded, not rate_limit: Hermes acts on the reason, and rate_limit benches the one key
         # in its credential pool after a retry (the flag that would stop it is not read). overloaded

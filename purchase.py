@@ -19,7 +19,7 @@ from .errors import CONSOLE
 SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£"}
 # How long a purchase is followed: an operator may take a while to activate one.
 FOLLOW_FOR = 3 * 3600
-TERMINAL = {"denied", "canceled", "cancelled", "expired", "failed", "provisioning_failed"}
+TERMINAL = {"denied", "canceled", "cancelled", "expired", "stopped", "failed", "provisioning_failed"}
 
 
 class PurchaseError(Exception):
