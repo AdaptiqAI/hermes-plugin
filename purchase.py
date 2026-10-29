@@ -83,11 +83,11 @@ def billing_note(offer: dict, mode: str | None) -> str | None:
     if offer["billing_note"]:
         return str(offer["billing_note"])
     if mode == "manual_activation":
-        return "Our team activates new lanes after you confirm."
-    if mode is None or offer["price"] is None:
+        return "Our team turns it on after you confirm."
+    if mode is None:
         return None
-    if period_word(offer["price"][2]) == "hour":
-        return "Runs from your balance and stops when you stop it."
+    if offer["price"] is None or period_word(offer["price"][2]) == "hour":
+        return "You pay per token from your balance. Reads from memory are free."
     return "You pay by card in your browser."
 
 
@@ -100,14 +100,14 @@ def offers_text(items: list[dict], mode: str | None, owned: dict[str, int]) -> s
         parts = [offer["name"]]
         if offer["price"] and offer["price"][0] is not None:
             amount, currency, period = offer["price"]
-            parts.append(f"{money(amount, currency)} per lane per {period_word(period)}")
+            parts.append(f"{money(amount, currency)} per {period_word(period)}")
         if offer["speed"]:
             parts.append(f"{round(offer['speed'])} tokens/s")
         if offer["region"]:
             parts.append(str(offer["region"]))
         lanes = owned.get(offer["name"].lower(), 0)
         if lanes:
-            parts.append(f"in your workspace ({lanes} {'lane' if lanes == 1 else 'lanes'})")
+            parts.append("in your workspace")
         if lane_limit(offer) == 0:
             parts.append("full right now")
         line = f"{number}. " + " · ".join(parts)
@@ -117,7 +117,7 @@ def offers_text(items: list[dict], mode: str | None, owned: dict[str, int]) -> s
     note = billing_note(items[0], mode) if len({billing_note(offer, mode) for offer in items}) == 1 else None
     if note:
         lines.append(note)
-    lines.append("Get one: /adaptiq get <number> [lanes]. Each lane runs one conversation at a time.")
+    lines.append("Get one: /adaptiq get <number> [at once], where at once is how many conversations can run at the same time.")
     return "\n".join(lines)
 
 
@@ -156,9 +156,9 @@ def start(offer: dict, lanes: int, key: str, purchase_url: str | None) -> dict:
     """
     limit = lane_limit(offer)
     if limit == 0:
-        raise PurchaseError(f"{offer['name']} has no free lanes right now. Try again later, or pick another model.")
+        raise PurchaseError(f"{offer['name']} is full right now. Try again later, or pick another model.")
     if lanes < offer["min_lanes"] or lanes > limit:
-        raise PurchaseError(f"Choose between {offer['min_lanes']} and {limit} lanes.")
+        raise PurchaseError(f"Choose between {offer['min_lanes']} and {limit} conversations at once.")
     try:
         status, reply = core._call("POST", "/cli-auth/purchase/requests", body={"offer_id": offer["id"], "lanes": lanes},
                                    key=key, headers={"idempotency-key": request_key(offer["id"], lanes, key)})

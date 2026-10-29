@@ -14,7 +14,7 @@ key to copy or paste. Each Hermes conversation keeps its own native memory on Ad
 
 - **Settings → AdaptiqAI** shows:
   - the workspace and memory use;
-  - each model with its lanes and how many run now, with the main model marked;
+  - each model and how many conversations run on it now, with the main model marked;
   - in its last two weeks, when the connection ends.
 
   It has buttons to sign in (again) and to open AdaptiqAI Knowledge. A new workspace is told how to get its
@@ -27,7 +27,7 @@ key to copy or paste. Each Hermes conversation keeps its own native memory on Ad
 - **Desktop:** Settings → AdaptiqAI → Sign in again, or "AdaptiqAI: Sign in" in the command
   palette.
 - **Any chat:** `/adaptiq`, or `/adaptiq status`. Status shows the workspace, library and conversation-history use, each model
-  with its lanes and how many run now, and, in its last two weeks, when the connection ends. Where AdaptiqAI puts idle conversations to sleep to
+  and how many conversations run on it now, and, in its last two weeks, when the connection ends. Where AdaptiqAI puts idle conversations to sleep to
   make room, one line says so; in ask mode, a suggestion gives the console link.
 - **Terminal:** `hermes adaptiq login`, or `hermes adaptiq status`.
 
@@ -38,14 +38,14 @@ A connection lasts 90 days. You can see it in the console under **API keys**, as
 
 A new workspace has no model yet, and you can get one without leaving Hermes:
 
-- **`/adaptiq models`** lists the models on offer. For each it shows the price per lane, the speed, the region,
+- **`/adaptiq models`** lists the models on offer. For each it shows the price, the speed, the region,
   and what your workspace already has.
-- **`/adaptiq get <number> [lanes]`** opens a page where the workspace owner confirms the lanes, and pays by card
-  if the offer asks for it (hourly lanes run from the workspace balance). Each lane runs one conversation at a
-  time.
+- **`/adaptiq get <number> [at once]`** opens a page where the workspace owner confirms the model, and how many
+  conversations can run on it at once. You pay per token from the workspace balance, and reads from memory
+  are free.
 
-The plugin follows the purchase until the lanes are on. Then the model joins Hermes' model list. If Hermes' main
-model has no lanes, the new model becomes the main model.
+The plugin follows the purchase until the model is on. Then the model joins Hermes' model list. If Hermes' main
+model is no longer in the workspace, the new model becomes the main model.
 
 ## Memory per conversation
 
@@ -105,7 +105,7 @@ behind its tool search, so the agent finds them by name when it needs them.
 
 The plugin tells Hermes what AdaptiqAI's answers mean, so Hermes recovers the right way:
 
-- **No lanes on a model, or a lane stopped while idle.** Hermes says the model isn't available and
+- **A model not in the workspace, or one that stopped while idle.** Hermes says the model isn't available and
   that you can pick another with `/model`. It no longer tells you to fix your API key.
 - **Memory full.** Hermes stops instead of retrying, and never compresses the conversation (AdaptiqAI
   keeps it whole). You can free up space in Knowledge, use another model, or continue with
@@ -114,7 +114,7 @@ The plugin tells Hermes what AdaptiqAI's answers mean, so Hermes recovers the ri
   a full memory means nothing idle could sleep, and Hermes says: "Memory is full and nothing idle
   could sleep. Delete or unpin a conversation in the console, or add memory." A new conversation
   frees nothing.
-- **All lanes busy, or a conversation being prepared.** Hermes retries by itself.
+- **A busy model, or a conversation being prepared.** Hermes retries by itself.
 - **Expired sign-in.** Hermes asks you to run `/adaptiq login`.
 
 Hermes Desktop shows these in AdaptiqAI's own words.
@@ -123,14 +123,14 @@ Hermes Desktop shows these in AdaptiqAI's own words.
 
 - `ADAPTIQ_API_KEY` in Hermes' `.env`.
 - A `providers.AdaptiqAI` entry pointing at `https://api.adaptiqai.com/v1`, with the key taken from
-  that variable. The model list is read live from the workspace, so a model rented later appears
+  that variable. The model list is read live from the workspace, so a model added later appears
   without signing in again.
-- The main model becomes the workspace model with the most lanes.
-- The entry follows your lanes. The plugin brings it in step when a conversation starts (at most every
+- The main model becomes the workspace model that can run the most conversations at once.
+- The entry follows your workspace's models. The plugin brings it in step when a conversation starts (at most every
   ten minutes) and on `/adaptiq status`:
-  - A model rented later gets its context window.
-  - A model whose lanes ended leaves the entry (the engine's own model stays listed without lanes, and is never made the main model).
-  - If Hermes' main model was one of those, it moves to the model with the most lanes.
+  - A model added later gets its context window.
+  - A model that left the workspace leaves the entry (the engine's own model stays listed, and is never made the main model).
+  - If Hermes' main model was one of those, it moves to the model that can run the most at once.
 - `compression.model_thresholds` gets `1.0` for each AdaptiqAI model that has no threshold of its
   own, so Hermes compacts those conversations only when they no longer fit (see Memory per
   conversation). A threshold you set yourself is kept.

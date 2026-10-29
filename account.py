@@ -44,12 +44,8 @@ def _model_detail(model: dict, main: str | None) -> list[str]:
     parts = []
     if _count(model.get("context_window")):
         parts.append(f"{format_tokens(model['context_window'])} context")
-    lanes = _count(model.get("lanes"))
-    if lanes is not None:
-        lane_text = f"{lanes} lane" if lanes == 1 else f"{lanes} lanes"
-        if _count(model.get("running_now")) is not None:
-            lane_text += f" ({model['running_now']} running, {_count(model.get('waiting_now')) or 0} waiting)"
-        parts.append(lane_text)
+    if _count(model.get("running_now")) is not None:
+        parts.append(f"{model['running_now']} running, {_count(model.get('waiting_now')) or 0} waiting")
     if model.get("status") == "offline":
         parts.append("offline")
     if model.get("id") == main:
@@ -149,7 +145,7 @@ def status_text(summary: dict, *, conversation: str | None = None, main: str | N
     else:
         lines.append("No models yet. /adaptiq models shows the models you can get.")
     if moved_from and main:
-        lines.append(f"Your main model was {_name_of(summary, moved_from)}, which has no lanes any more. "
+        lines.append(f"Your main model was {_name_of(summary, moved_from)}, which is no longer in your workspace. "
                      f"It is {_name_of(summary, main)} now.")
     conversations, knowledge = _count(memory.get("conversations_tokens")), _count(memory.get("knowledge_tokens"))
     if memory.get("available") and conversations is not None and knowledge is not None and _history(memory) is None:

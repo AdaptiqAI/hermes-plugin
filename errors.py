@@ -24,16 +24,16 @@ MEMORY_FULL_LIBRARY = ("Your library is full. Remove a collection you no longer 
                        "or add memory.")
 SIGN_IN = "Your AdaptiqAI sign-in has expired. Run /adaptiq login to sign in again."
 # No model is named: the models change all the time (Simon, 2026-10-15).
-NO_LANES = ("You need to rent a lane or subscribe to AdaptiqAI to continue. Get lanes with /adaptiq models, "
-            "or pick another model with /model.")
+NO_LANES = ("This model isn't in your workspace yet. Get it with /adaptiq models (you pay per token from your "
+            "balance), or pick another model with /model.")
 # What older gateways said for every model without lanes. Newer ones say where to rent, and that
 # sentence is passed on.
 _UNNAMED = ("model access is required", "select an authorized model", "instance access is required")
-GET_HERE = "Or get lanes here with /adaptiq models."
+GET_HERE = "Or get a model here with /adaptiq models."
 # What a payment ends, when the gateway says nothing of its own.
-PAUSED = "Your balance ran out, so your lanes are paused. Add funds in the AdaptiqAI console to continue."
-PLAN_USED_UP = "Your plan's usage is used up for now. Rent extra lanes with /adaptiq models in the meantime."
-BUSY = "All of your lanes on {name} are busy. Your request will retry automatically in a moment."
+PAUSED = "Your balance ran out. Add funds in the AdaptiqAI console to continue."
+PLAN_USED_UP = "Your plan's usage is used up for now. Pay per token from your balance in the meantime."
+BUSY = "{name} is busy. Your request will retry automatically in a moment."
 # Types and codes only AdaptiqAI sends: an error that carries one is AdaptiqAI's even with no
 # status, as one raised inside a stream is.
 _OWN = ("adaptiq", "memory_capacity_exceeded", "inference_entitlement_required", "instance_access_required",

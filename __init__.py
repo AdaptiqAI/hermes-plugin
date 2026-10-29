@@ -25,7 +25,7 @@ from . import wire
 
 logger = logging.getLogger(__name__)
 
-USAGE = "Usage: /adaptiq [login|status|private|remember|knowledge|models|get <number> [lanes]]"
+USAGE = "Usage: /adaptiq [login|status|private|remember|knowledge|models|get <number> [at once]]"
 PRIVATE = ("Private: new messages of this conversation are no longer saved to workspace memory. "
            "Existing memory is kept. /adaptiq remember turns saving back on.")
 SAVING = "Saving: new messages of this conversation are saved to workspace memory again."
@@ -355,7 +355,7 @@ def _get(words: list[str]) -> str:
     from hermes_cli.config import get_env_value
 
     if not words:
-        return "Usage: /adaptiq get <number> [lanes]. /adaptiq models lists the models you can get."
+        return "Usage: /adaptiq get <number> [at once]. /adaptiq models lists the models you can get."
     key = get_env_value(core.KEY_ENV)
     if not key:
         return "Connect AdaptiqAI first: /adaptiq login."
@@ -370,13 +370,13 @@ def _get(words: list[str]) -> str:
     if offer is None:
         return "That model isn't on offer. /adaptiq models lists the models you can get."
     if len(words) > 1 and not (words[1].isascii() and words[1].isdecimal()):
-        return "Give the lanes as a number, for example /adaptiq get 1 2."
+        return "Give how many at once as a number, for example /adaptiq get 1 2."
     lanes = int(words[1]) if len(words) > 1 else offer["min_lanes"]
     with _purchases_lock:
         waiting = _purchases.get(offer["id"])
     if waiting is not None:
         if waiting["lanes"] != lanes:
-            return (f"A purchase of {waiting['lanes']} on {offer['name']} is already waiting for you: "
+            return (f"A purchase of {offer['name']} ({waiting['lanes']} at once) is already waiting for you: "
                     f"{waiting['url']} Finish or cancel it first.")
         return f"A purchase of {offer['name']} is already waiting for you in the browser: {waiting['url']}"
     model_id, purchase_url = purchase.model_for(offer, core.account_summary() or {})
@@ -416,12 +416,11 @@ def _get(words: list[str]) -> str:
     # copy_context keeps the caller's profile scope, so the right config is written.
     threading.Thread(target=contextvars.copy_context().run, args=(run,), name="adaptiq-purchase", daemon=True).start()
     opened = _browser_available() and webbrowser.open(started["url"])
-    count = f"{lanes} {'lane' if lanes == 1 else 'lanes'}"
-    lines = [f"{'Your browser opened' if opened else 'Open this page'} to confirm {count} on {offer['name']}: {started['url']}"]
+    lines = [f"{'Your browser opened' if opened else 'Open this page'} to confirm {offer['name']}: {started['url']}"]
     note = purchase.billing_note(offer, mode)
     if note:
         lines.append(note)
-    lines.append(f"{offer['name']} becomes usable here as soon as its lanes are on; /adaptiq status shows them.")
+    lines.append(f"{offer['name']} becomes usable here as soon as it is on; /adaptiq status shows it.")
     return "\n".join(lines)
 
 
