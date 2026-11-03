@@ -214,6 +214,38 @@ def library(model: str, query: str | None = None, cursor: str | None = None,
     return {"items": items, "next_cursor": pagination.get("next_cursor"), "has_more": pagination.get("has_more") is True}
 
 
+def files(model: str, memory_id: str, offset: int = 0) -> dict:
+    """A page of the documents a collection holds now (core's knowledgeFiles)."""
+    params = urllib.parse.urlencode({"offset": str(max(0, int(offset))), "limit": "200"})
+    body = _call("GET", f"/memories/{urllib.parse.quote(memory_id, safe='')}/files?{params}", model=model) or {}
+    found = [{"path": str(row["path"]), "lines": int(row.get("lines") or 0)}
+             for row in body.get("files") or [] if isinstance(row, dict) and row.get("path")]
+    after = body.get("next_offset")
+    return {"documents": found, "total": int(body.get("total") or len(found)),
+            "next_offset": after if isinstance(after, int) else None}
+
+
+def search(model: str, memory_id: str, pattern: str, path: str | None = None) -> dict:
+    """Lines of a collection's current text a regular expression matches, each the part of its line around
+    the match with one line on each side (core's searchKnowledge with reading.ts's FIND_SHAPE)."""
+    params = {"kind": "grep", "pattern": pattern, "limit": "25", "chars": "500", "context": "1"}
+    if path:
+        params["path"] = path
+    query = urllib.parse.urlencode(params)
+    body = _call("GET", f"/memories/{urllib.parse.quote(memory_id, safe='')}/search?{query}", model=model) or {}
+    found = []
+    for row in body.get("matches") or []:
+        if not isinstance(row, dict) or not row.get("path"):
+            continue
+        line = int(row.get("line") or 0)
+        before = [text for text in row.get("before") or [] if isinstance(text, str)]
+        after = [text for text in row.get("after") or [] if isinstance(text, str)]
+        found.append(f"{row['path']}:{line}: {row.get('text') or ''}")
+        found += [f"  {line - len(before) + i}: {text}" for i, text in enumerate(before) if text]
+        found += [f"  {line + 1 + i}: {text}" for i, text in enumerate(after) if text]
+    return {"lines": found, "truncated": body.get("truncated") is True}
+
+
 def _revision(session_id: str, model: str | None) -> int:
     """The conversation's revision, storing the conversation first when AdaptiqAI has none yet."""
     refused = None

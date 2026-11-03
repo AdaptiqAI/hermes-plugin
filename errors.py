@@ -138,8 +138,12 @@ def classify(status: int | None, body, model: str, auto_sleep: bool = False) -> 
         # in its credential pool after a retry (the flag that would stop it is not read). overloaded
         # is retried on the same key and then falls back, as Hermes itself does for a busy engine.
         return {"reason": "overloaded", "should_fallback": True, "message": BUSY.format(name=name)}
+    # A 425 says the conversation's newest history is still queued to compile after a pause; it
+    # clears by itself within a minute or two. Hermes retries overloaded for about five minutes
+    # (its retries, then its recovery ladder) with only a neutral waiting line, never an error card.
     if (has("AdaptiqNativePreflightBusy", "session_route_unavailable", "conversation_preparing",
-            "upload_capacity_exhausted") or (status == 503 and not has("offline"))):
+            "upload_capacity_exhausted", "AdaptiqMemoryNotReady")
+            or status == 425 or (status == 503 and not has("offline"))):
         return {"reason": "overloaded", "message": PREPARING}
     if status == 409 and has("AdaptiqNativePreflight", "conversation"):
         return {"reason": "overloaded", "message": CONVERSATION_BUSY}
