@@ -22,24 +22,35 @@ MEMORY_NO_ROOM = ("Memory is full and nothing idle could sleep. Delete or unpin 
                   "or add memory.")
 MEMORY_FULL_LIBRARY = ("Your library is full. Remove a collection you no longer need in the console, "
                        "or add memory.")
-SIGN_IN = "Your AdaptiqAI sign-in has expired. Run /adaptiq login to sign in again."
-# No model is named: the models change all the time (Simon, 2026-10-15).
-NO_LANES = ("This model isn't in your workspace yet. Get it with /adaptiq models (you pay per token from your "
-            "balance), or pick another model with /model.")
-# What older gateways said for every model without lanes. Newer ones say where to rent, and that
+SIGN_IN = "Your AdaptiqAI sign-in has expired. Run /adaptiq signin to sign in again."
+# No model is named: the models change all the time (Simon, 2026-10-15). Lanes are not sold (2026-10-29), so
+# nothing here offers to get one.
+NO_LANES = ("This model isn't in your workspace yet. Pick another model with /model; /adaptiq lists your "
+            "workspace's models.")
+# What older gateways said for every model without lanes. Newer ones say what to do, and that
 # sentence is passed on.
 _UNNAMED = ("model access is required", "select an authorized model", "instance access is required")
-GET_HERE = "Or get a model here with /adaptiq models."
-# What a payment ends, when the gateway says nothing of its own.
-PAUSED = "Your balance ran out. Add funds in the AdaptiqAI console to continue."
+# Where funds are added: the console's billing page, as the gateway's own refusal names it.
+BILLING = f"{CONSOLE}#/billing"
+# What an empty balance says when the gateway says nothing of its own (core's out-of-credit words).
+PAUSED = f"Your balance ran out. Add funds to continue: {BILLING}"
 PLAN_USED_UP = "Your plan's usage is used up for now. Pay per token from your balance in the meantime."
+# The balance codes: an empty balance under token billing, a lane paused for one, a balance a payment review holds.
+_BALANCE = ("insufficient_balance", "rental_paused", "balance_on_hold")
 BUSY = "{name} is busy. Your request will retry automatically in a moment."
 # Types and codes only AdaptiqAI sends: an error that carries one is AdaptiqAI's even with no
 # status, as one raised inside a stream is.
 _OWN = ("adaptiq", "memory_capacity_exceeded", "inference_entitlement_required", "instance_access_required",
         "lane_access", "rental_stopped_unused", "rental_paused", "plan_usage_exhausted", "inflightlimit",
+        "insufficient_balance", "balance_on_hold",
         "session_route_unavailable", "conversation_preparing", "upload_capacity_exhausted")
 PREPARING = "AdaptiqAI is getting your conversation ready. It will retry automatically."
+# "Getting ready" again while the conversation memory is full (core's memoryFullPreparing). Idle conversations sleep
+# on their own, but none could (one still getting ready is not idle), so nothing gets ready until some are deleted.
+# On 2026-11-09 MiMo's 20M stood at 19,996,672 for an hour, and every new conversation answered "getting ready".
+MEMORY_FULL_PREPARING = ("AdaptiqAI can't get this conversation ready: the workspace's conversation memory is full "
+                         "({used} of {limit}), and nothing idle could sleep to make room. Delete conversations you no "
+                         "longer need in the AdaptiqAI console, then send your message again.")
 CONVERSATION_BUSY = ("This conversation couldn't be opened on AdaptiqAI just now. It will retry "
                      "automatically; your saved memory is unchanged.")
 
@@ -88,6 +99,35 @@ def is_memory_full(status: int | None, body) -> bool:
     return status == 507 or "memory_capacity_exceeded" in f"{kind} {code} {message}".lower()
 
 
+def memory_full_preparing(used: str, limit: str) -> dict:
+    """The verdict for a conversation getting ready again while the conversation memory is full: the turn ends now,
+    as for a full memory, instead of Hermes' minutes of retries. `used` and `limit` as the console writes them."""
+    return {"reason": "unknown", "retryable": False, "should_compress": False, "should_rotate_credential": False,
+            "should_fallback": False, "message": MEMORY_FULL_PREPARING.format(used=used, limit=limit)}
+
+
+def ends_for_full_memory(verdict: dict | None) -> bool:
+    """Whether a verdict ends the turn for a full memory: a 507's, or memory_full_preparing's. They alone are
+    "unknown" and not retried."""
+    return verdict is not None and verdict.get("reason") == "unknown" and verdict.get("retryable") is False
+
+
+def action(status: int | None, body) -> str | None:
+    """What the person can do about a refusal, for Hermes Desktop's buttons (DeepSeek Harness's notices): "sign_in"
+    again, add "funds", or get "access" to the model; None when it ends by itself or by something else."""
+    message, kind, code = server_detail(body)
+    haystack = f"{kind} {code} {message}".lower()
+    if status == 401:
+        return "sign_in"
+    if code in _BALANCE or (status == 402 and code != "plan_usage_exhausted"):
+        return "funds"
+    if (any(needle.lower() in haystack for needle in ("AdaptiqLaneAccessRequired", "inference_entitlement_required",
+                                                       "instance_access_required", "lane_access"))
+            or (status == 403 and any(needle in haystack for needle in ("lane", "entitle", "model access")))):
+        return "access"
+    return None
+
+
 def classify(status: int | None, body, model: str, auto_sleep: bool = False) -> dict | None:
     """The verdict for Hermes' `transform_api_error_classification` hook, or None to leave it to Hermes.
 
@@ -117,22 +157,22 @@ def classify(status: int | None, body, model: str, auto_sleep: bool = False) -> 
         return {"reason": "auth", "retryable": False, "should_rotate_credential": True, "should_fallback": True,
                 "message": SIGN_IN}
     if code == "rental_stopped_unused":
-        # The gateway says why and where to rent again.
+        # The gateway says why.
         return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
-                "message": f"{message} {GET_HERE}" if message else NO_LANES}
-    if code in ("rental_paused", "plan_usage_exhausted"):
+                "message": message or NO_LANES}
+    if code in (*_BALANCE, "plan_usage_exhausted") or status == 402:
         # A payment ends these. Hermes takes a 402 for spent credit and benches the key for an hour,
-        # past the funds or the extra lanes that end it; model_not_found benches nothing and is not
-        # retried. The gateway says what to do, and until when.
+        # past the funds that end it; model_not_found benches nothing and is not retried. The gateway
+        # says what to do, and where: an empty balance names the page that adds funds.
         return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
-                "message": message or (PAUSED if code == "rental_paused" else PLAN_USED_UP)}
+                "message": message or (PLAN_USED_UP if code == "plan_usage_exhausted" else PAUSED)}
     if (has("AdaptiqLaneAccessRequired", "inference_entitlement_required", "instance_access_required", "lane_access")
             or (status == 403 and has("lane", "entitle", "model access"))):
         # model_not_found, not model_entitlement: that one benches the key for the model, and a
         # rental started a minute later must work at once.
         said = message and not message.lower().startswith(_UNNAMED)
         return {"reason": "model_not_found", "retryable": False, "should_fallback": True,
-                "message": f"{message} {GET_HERE}" if said else NO_LANES}
+                "message": message if said else NO_LANES}
     if status == 429 or has("AdaptiqLaneQueueTimeout", "InflightLimit"):
         # overloaded, not rate_limit: Hermes acts on the reason, and rate_limit benches the one key
         # in its credential pool after a retry (the flag that would stop it is not read). overloaded

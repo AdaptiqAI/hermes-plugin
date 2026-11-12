@@ -1,8 +1,14 @@
 """AdaptiqAI sign-in for Hermes, shared by the slash command, the CLI and the Desktop routes.
 
 Device flow (docs/HARNESS_PLUGINS.md in the gateway repo) -> key in Hermes' .env under
-ADAPTIQ_API_KEY -> a ``providers.AdaptiqAI`` entry pointing at it through ``key_env`` -> the main
-model on the workspace model with the most lanes. Stdlib only, so the plugin has no dependencies.
+ADAPTIQ_API_KEY (and, kept apart, ADAPTIQ_SIGNIN_KEY) -> a ``providers.AdaptiqAI`` entry pointing at it
+through ``key_env`` -> the main model on the workspace model with the most lanes. Stdlib only, so the
+plugin has no dependencies.
+
+Hermes can hold several AdaptiqAI keys: the one this computer's sign-in made, the one Connect writes
+into ADAPTIQ_API_KEY, and the one a long-running Hermes read from its environment when it started.
+Every call tries them in turn, and a key the server refuses (401) gives way to the next (core's
+apiKeys), so an old key never hides a working one.
 """
 
 from __future__ import annotations
@@ -12,16 +18,23 @@ import json
 import os
 import platform
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import wire
+from . import account, wire
 
 # ADAPTIQ_API_BASE points a test at a local gateway; customers never set it.
 API = os.environ.get("ADAPTIQ_API_BASE", "https://api.adaptiqai.com/v1").rstrip("/")
 KEY_ENV = "ADAPTIQ_API_KEY"
+# This computer's own sign-in key, kept apart from ADAPTIQ_API_KEY, which Connect writes too: whichever
+# wrote last, the other key is still there to give way to.
+SIGNIN_ENV = "ADAPTIQ_SIGNIN_KEY"
+# How long a key the server refused is skipped before it is tried again: a long-running Hermes
+# must not stay signed out over one passing refusal.
+REFUSED_FOR = 600
 # The entry's key, as the console's setup command and Hermes Desktop's own Save name it.
 PROVIDER = "AdaptiqAI"
 APP = "Hermes"
@@ -44,6 +57,114 @@ def _call(method: str, path: str, body: dict | None = None, key: str | None = No
         except ValueError:
             reply = {}
         return error.code, reply if isinstance(reply, dict) else {}
+
+
+_refused: dict[str, float] = {}
+_refused_lock = threading.Lock()
+
+
+def _env_values(name: str) -> list[str]:
+    """A variable's values as Hermes resolves them: .env first, as Hermes' own provider auth reads it,
+    then this process's environment, which a long-running gateway took when it started."""
+    try:
+        from hermes_cli import config
+    except ImportError:
+        return []
+    values = []
+    for read in (getattr(config, "get_env_value_prefer_dotenv", None), getattr(config, "get_env_value", None)):
+        try:
+            value = read(name) if read is not None else None
+        except Exception:  # a scoped read that can't answer here
+            value = None
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return values
+
+
+def _entry_keys() -> list[str]:
+    """The keys of AdaptiqAI provider entries that keep theirs elsewhere: a Desktop-made custom endpoint's own
+    variable, or a key pasted into the entry."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return []
+    providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+    model = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    rows = [row for row in [*providers.values(), model]
+            if isinstance(row, dict) and str(row.get("base_url") or "").rstrip("/") == API]
+    found = []
+    for row in rows:
+        pasted = row.get("api_key")
+        if isinstance(pasted, str) and pasted.strip() and not pasted.strip().startswith(("$", "op://")):
+            found.append(pasted.strip())
+        env = row.get("key_env")
+        if isinstance(env, str) and env and env not in (KEY_ENV, SIGNIN_ENV):
+            found += _env_values(env)
+    return found
+
+
+def keys() -> list[str]:
+    """Every AdaptiqAI key Hermes has, in the order to try them (core's apiKeys): ADAPTIQ_API_KEY as .env and
+    this process hold it, this computer's own sign-in, then any other AdaptiqAI entry's key."""
+    return list(dict.fromkeys([*_env_values(KEY_ENV), *_env_values(SIGNIN_ENV), *_entry_keys()]))
+
+
+def _usable(value: str, now: float) -> bool:
+    return now - _refused.get(value, -REFUSED_FOR) >= REFUSED_FOR
+
+
+def key() -> str | None:
+    """The first key the server has not refused lately, or None: not connected, or every key refused."""
+    now = time.monotonic()
+    with _refused_lock:
+        return next((value for value in keys() if _usable(value, now)), None)
+
+
+def phase() -> str:
+    """`connected`, `expired` (keys, all refused) or `signed-out` (none), as core's AuthManager names them."""
+    return "connected" if key() else "expired" if keys() else "signed-out"
+
+
+def refuse(value: str) -> None:
+    """The server refused this key (401): the next one is tried instead."""
+    with _refused_lock:
+        _refused[value] = time.monotonic()
+
+
+def _heal(working: str) -> None:
+    """Hermes' chats send ADAPTIQ_API_KEY. When the server refused what it holds and another key works, it
+    holds the working key from now on, in .env and in this process."""
+    configured = _env_values(KEY_ENV)
+    if not configured or configured[0] == working:
+        return
+    # The first is what Hermes' provider auth sends: .env's value, else the environment's.
+    with _refused_lock:
+        dead = not _usable(configured[0], time.monotonic())
+    if not dead:
+        return
+    try:
+        from hermes_cli.config import save_env_value
+        save_env_value(KEY_ENV, working)
+    except Exception:  # Hermes' writer could not: the plugin's own calls still use the working key
+        return
+
+
+def authed(method: str, path: str, body: dict | None = None, headers: dict | None = None,
+           timeout: float = 15) -> tuple[int, dict]:
+    """A call with the first usable key; one the server refuses (401) gives way to the next. 401 with no key
+    left. Network failures raise, as `_call`'s do."""
+    status, reply, tried = 401, {}, set()
+    while True:
+        current = key()
+        if current is None or current in tried:
+            return status, reply
+        tried.add(current)
+        status, reply = _call(method, path, body, current, headers, timeout)
+        if status != 401:
+            _heal(current)
+            return status, reply
+        refuse(current)
 
 
 def device_name() -> str:
@@ -83,10 +204,24 @@ def wait(started: dict) -> str:
     raise RuntimeError("The sign-in timed out.")
 
 
-def _model_rows(key: str) -> list[dict] | None:
+# Each model's `/v1/models` row as last read: its capability card (thinking levels, what it reads, its output cap)
+# shapes requests without asking again.
+_rows: dict[str, dict] = {}
+
+
+def _model_rows() -> list[dict] | None:
     """The models the workspace has lanes on, or None when AdaptiqAI did not answer with a list."""
-    status, listing = _call("GET", "/models", key=key, timeout=5)
-    return [row for row in (listing.get("data") or []) if row.get("id")] if status == 200 else None
+    status, listing = authed("GET", "/models", timeout=5)
+    if status != 200:
+        return None
+    rows = [row for row in (listing.get("data") or []) if isinstance(row, dict) and row.get("id")]
+    _rows.update({row["id"]: row for row in rows})
+    return rows
+
+
+def model_row(model_id: str) -> dict | None:
+    """A model's `/v1/models` row as last read, or None before the first read."""
+    return _rows.get(model_id)
 
 
 def _lanes(row: dict) -> int:
@@ -131,6 +266,11 @@ def _in_step(entry: dict, rows: list[dict]) -> dict:
         settings = dict(known.get(row["id"]) or {})
         if row.get("context_window"):
             settings["context_length"] = row["context_window"]
+        # What the model reads, from its card: Hermes sends images only to a model marked to see them, and
+        # describes them for one that reads text only.
+        card = row.get("adaptiq_capabilities")
+        if isinstance(card, dict):
+            settings["supports_vision"] = "image" in wire.card_input(card)
         models[row["id"]] = settings
     entry["models"] = models
     if rows and entry.get("model") not in models and _main_model(rows):
@@ -145,16 +285,22 @@ def _in_step(entry: dict, rows: list[dict]) -> dict:
 # Hermes compacts a conversation from a share of the model's window. AdaptiqAI keeps the whole
 # conversation in native memory, as the DeepSeek Harness plugin declines compaction to keep it whole;
 # Hermes has no per-provider way to decline, so its AdaptiqAI models compact only once the input
-# budget is full (`compression.model_thresholds`), where the request would not fit anyway.
-COMPACT_AT = 1.0
+# budget is full (`compression.model_thresholds`), where the request would not fit anyway. Full is
+# just under 1.0: Hermes reads a threshold at or above the window as 85% of it.
+COMPACT_AT = 0.99
+
+
+def _unreachable(value) -> bool:
+    """A threshold Hermes reads as 85%: 1.0, which earlier versions wrote, or more."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 1
 
 
 def _compact_when_full(cfg: dict, model_ids) -> bool:
-    """Give each AdaptiqAI model the compact-when-full threshold, keeping one the person set.
-    Returns True when the config changed."""
+    """Give each AdaptiqAI model the compact-when-full threshold, keeping one the person set unless
+    Hermes reads it as 85%. Returns True when the config changed."""
     compression = dict(cfg["compression"]) if isinstance(cfg.get("compression"), dict) else {}
     thresholds = dict(compression["model_thresholds"]) if isinstance(compression.get("model_thresholds"), dict) else {}
-    missing = [model for model in model_ids if model and model not in thresholds]
+    missing = [model for model in model_ids if model and (model not in thresholds or _unreachable(thresholds[model]))]
     if not missing:
         return False
     thresholds.update({model: COMPACT_AT for model in missing})
@@ -171,8 +317,12 @@ def apply(token: str) -> tuple[str, list[str]]:
     """
     from hermes_cli.config import load_config, save_config, save_env_value
 
-    rows = _model_rows(token) or []
+    # The new key is this computer's own: kept apart too, so a key Connect writes later never loses it.
     save_env_value(KEY_ENV, token)
+    save_env_value(SIGNIN_ENV, token)
+    with _refused_lock:
+        _refused.pop(token, None)
+    rows = _model_rows() or []
     default = _main_model(rows)
 
     cfg = load_config()
@@ -208,10 +358,9 @@ def sync() -> dict:
     entry. When the main model was an AdaptiqAI model that has no lanes any more, it moves to the
     model with the most lanes. Writes nothing when AdaptiqAI does not answer or nothing changed.
     """
-    from hermes_cli.config import get_env_value, load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
-    key = get_env_value(KEY_ENV)
-    rows = _model_rows(key) if key else None
+    rows = _model_rows() if key() else None
     # No list, or an empty one, is not a workspace with no models: nothing is taken away on it.
     if not rows:
         return {"synced": False}
@@ -244,10 +393,9 @@ def start_on(model_id: str) -> bool:
     """Make a model that just got lanes Hermes' main model when the main model is an AdaptiqAI model
     without lanes, or there is none. A main model on another provider is the person's choice, and
     stays: /model switches. Returns True when it changed."""
-    from hermes_cli.config import get_env_value, load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
-    key = get_env_value(KEY_ENV)
-    rows = (_model_rows(key) if key else None) or []
+    rows = (_model_rows() if key() else None) or []
     if not any(row["id"] == model_id and _lanes(row) > 0 for row in rows):
         return False
     cfg = load_config()
@@ -281,13 +429,10 @@ def main_model() -> str | None:
 
 def account_summary() -> dict | None:
     """`/v1/account/summary`: workspace, connection, models with lanes and memory; None without it."""
-    from hermes_cli.config import get_env_value
-
-    key = get_env_value(KEY_ENV)
-    if not key:
+    if not key():
         return None
     try:
-        code, summary = _call("GET", "/account/summary", key=key, timeout=5)
+        code, summary = authed("GET", "/account/summary", timeout=5)
     except (OSError, ValueError):
         return None
     return summary if code == 200 and summary.get("schema") == "adaptiq-account-summary-v1" else None
@@ -322,14 +467,11 @@ def mark_entry() -> bool:
 def session_stored(session_id: str, model: str | None = None) -> bool:
     """Whether AdaptiqAI stores this conversation. A private turn of one it stores is read back
     without saving; anything else runs ephemeral, so a failed lookup costs speed, never privacy."""
-    from hermes_cli.config import get_env_value
-
-    key = get_env_value(KEY_ENV)
-    if not key:
+    if not key():
         return False
     try:
-        code, _ = _call("GET", "/sessions/" + urllib.parse.quote(session_id, safe=""), key=key,
-                        headers={"x-adaptiq-model": model} if model else None, timeout=3)
+        code, _ = authed("GET", "/sessions/" + urllib.parse.quote(session_id, safe=""),
+                         headers={"x-adaptiq-model": model} if model else None, timeout=3)
     except (OSError, ValueError):  # unreachable, slow or not JSON: ephemeral is always safe
         return False
     return code == 200
@@ -338,13 +480,10 @@ def session_stored(session_id: str, model: str | None = None) -> bool:
 def session_memory() -> dict | None:
     """`GET /v1/workspace/session-memory`: which conversations sleep and any ask-mode suggestion.
     None without the `session_memory` scope, on an older gateway, or when it can't be reached."""
-    from hermes_cli.config import get_env_value
-
-    key = get_env_value(KEY_ENV)
-    if not key:
+    if not key():
         return None
     try:
-        code, view = _call("GET", "/workspace/session-memory", key=key, timeout=5)
+        code, view = authed("GET", "/workspace/session-memory", timeout=5)
     except Exception:  # unreachable, slow, cut short or not JSON: the status answers without it
         return None
     return view if code == 200 and isinstance(view, dict) else None
@@ -367,13 +506,71 @@ def auto_sleep(model: str) -> bool:
     return sleeps(own if isinstance(own, dict) else summary.get("memory"))
 
 
-def status() -> dict:
-    from hermes_cli.config import get_env_value
+# Each model's memory as last read for a conversation still getting ready, and when (monotonic seconds).
+_usage_read: dict[str, tuple[float, dict | None]] = {}
+USAGE_EVERY = 15
 
-    key = get_env_value(KEY_ENV)
-    if not key:
-        return {"signed_in": False}
-    code, who = _call("GET", "/cli-auth/whoami", key=key, timeout=5)
-    return {"signed_in": code == 200,
+
+def session_memory_full(model: str) -> dict | None:
+    """A model's conversation memory when it is full (account.SESSION_FULL), for a conversation still getting ready:
+    its `used` and `limit`, from `GET /v1/workspace/usage`, read again when the last reading is 15 seconds old (core's
+    sessionMemoryFull). None when it has room, or can't be told."""
+    at, known = _usage_read.get(model, (float("-inf"), None))
+    now = time.monotonic()
+    if now - at >= USAGE_EVERY:
+        try:
+            code, usage = authed("GET", "/workspace/usage", headers={"x-adaptiq-model": model}, timeout=5)
+        except Exception:  # unreachable, slow, cut short or not JSON: the last reading stands
+            code, usage = 0, None
+        known = (account.memory_view(usage) if code == 200 else None) or known
+        _usage_read[model] = (now, known)
+    session = (known or {}).get("session")
+    return session if session is not None and session["fraction"] >= account.SESSION_FULL else None
+
+
+def status() -> dict:
+    """Whether a key works, from `/v1/cli-auth/whoami`: the workspace, when it ends, and whether the key is this
+    computer's sign-in (`device`) or an API key (`api_key`)."""
+    if not key():
+        return {"signed_in": False, "phase": phase()}
+    code, who = authed("GET", "/cli-auth/whoami", timeout=5)
+    connection = who.get("connection") if isinstance(who.get("connection"), dict) else {}
+    return {"signed_in": code == 200, "phase": "connected" if code == 200 else phase(),
             "workspace": (who.get("workspace") or {}).get("label", ""),
-            "expires_at": (who.get("connection") or {}).get("expires_at")}
+            "expires_at": connection.get("expires_at"), "kind": connection.get("kind")}
+
+
+def sign_out() -> bool:
+    """Forget this computer's sign-in (core's signOut): its key leaves Hermes' .env, and ADAPTIQ_API_KEY too where
+    it holds that key, or a device sign-in made before the key was kept apart. A key Connect or the person
+    configured stays. Returns whether a usable key is left."""
+    from hermes_cli import config
+
+    own = set(_env_values(SIGNIN_ENV))
+    configured = _env_values(KEY_ENV)
+    if configured and (configured[0] in own or (not own and _device(configured[0]))):
+        _forget(config, KEY_ENV)
+    _forget(config, SIGNIN_ENV)
+    with _refused_lock:
+        _refused.clear()
+    return key() is not None
+
+
+def _device(value: str) -> bool:
+    """Whether a key is a browser sign-in of Hermes, as the server knows it."""
+    try:
+        code, who = _call("GET", "/cli-auth/whoami", key=value, timeout=5)
+    except (OSError, ValueError):
+        return False
+    connection = who.get("connection") if isinstance(who.get("connection"), dict) else {}
+    return code == 200 and connection.get("kind") == "device" and connection.get("app") in ("", APP, None)
+
+
+def _forget(config, name: str) -> None:
+    """Take a variable out of Hermes' .env and this process (Hermes' writer does both, within the profile's
+    scope); an older Hermes without remove_env_value empties it."""
+    remove = getattr(config, "remove_env_value", None)
+    if remove is not None:
+        remove(name)
+    else:
+        config.save_env_value(name, "")

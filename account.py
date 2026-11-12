@@ -9,6 +9,9 @@ CONSOLE = "https://memory.adaptiqai.com/memory"
 
 # Say when the connection ends once it is this close; sign-in makes a 90-day key.
 EXPIRY_NOTICE_DAYS = 14
+# A conversation memory this full is past where idle conversations sleep on their own, so none could: nothing gets
+# ready until some are deleted (core's SESSION_FULL). On 2026-11-09 MiMo's stood at 99.98 % for an hour.
+SESSION_FULL = 0.99
 
 
 def format_tokens(value: float) -> str:
@@ -40,40 +43,57 @@ def _count(value) -> int | None:
     return value if isinstance(value, (int, float)) and value >= 0 else None
 
 
-def _model_detail(model: dict, main: str | None) -> list[str]:
-    parts = []
-    if _count(model.get("context_window")):
-        parts.append(f"{format_tokens(model['context_window'])} context")
-    if _count(model.get("running_now")) is not None:
-        parts.append(f"{model['running_now']} running, {_count(model.get('waiting_now')) or 0} waiting")
-    if model.get("status") == "offline":
-        parts.append("offline")
-    if model.get("id") == main:
-        parts.append("main model")
-    return parts
+def memory_view(raw) -> dict | None:
+    """The workspace memory as core's memoryView reads it: used/limit are the library (knowledge); session history,
+    where the server reports it apart, is beside it. None when its size is not known."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("available") is False:
+        return {"available": False}
+    used, limit = _count(raw.get("used_tokens")), _count(raw.get("limit_tokens"))
+    if used is None or not limit:
+        return None
+    session_limit, session_used = _count(raw.get("session_limit_tokens")), _count(raw.get("session_tokens"))
+    session_ratio = _count(raw.get("session_usage_ratio"))
+    session = ({"used": session_used, "limit": session_limit,
+                "fraction": min(1, session_ratio if session_ratio is not None else session_used / session_limit)}
+               if session_limit and session_used is not None else None)
+    conversations = _count(raw.get("conversations_tokens"))
+    if conversations is None:
+        conversations = _count(raw.get("session_tokens"))
+    knowledge = _count(raw.get("knowledge_tokens"))
+    split = conversations is not None and knowledge is not None and conversations + knowledge == used
+    return {"available": True, "used": used, "limit": limit, "fraction": min(1, used / limit),
+            "full": raw.get("full") is True or used >= limit, "session": session,
+            "conversations": conversations if split else None, "knowledge": knowledge if split else None}
+
+
+def _model_detail(model: dict, main: str | None) -> str:
+    """What follows a model's name on its line (core's statusText), with Hermes' main model marked."""
+    window = f" · {format_tokens(model['context_window'])} context" if _count(model.get("context_window")) else ""
+    live = (f" ({model['running_now']} running, {_count(model.get('waiting_now')) or 0} waiting)"
+            if _count(model.get("running_now")) is not None else "")
+    offline = " · offline" if model.get("status") == "offline" else ""
+    return f"{window}{live}{offline}{' · main model' if main and model.get('id') == main else ''}"
+
+
+def _model_name(model: dict) -> str:
+    return str(model.get("display_name") or model.get("id"))
 
 
 def _model_line(model: dict, main: str | None) -> str:
-    return "• " + " · ".join([str(model.get("display_name") or model.get("id")), *_model_detail(model, main)])
+    return f"• {_model_name(model)}{_model_detail(model, main)}"
 
 
-def _memory_text(memory: dict) -> str | None:
-    if not (memory.get("available", True) and _count(memory.get("limit_tokens"))):
-        return None
-    fraction = memory.get("fraction", memory.get("usage_ratio"))
-    if not isinstance(fraction, (int, float)):
-        fraction = (memory.get("used_tokens") or 0) / memory["limit_tokens"]
-    return (f"{format_tokens(memory.get('used_tokens') or 0)} of {format_tokens(memory['limit_tokens'])} "
-            f"({format_percent(fraction)})")
-
-
-def _history(memory: dict) -> float | None:
-    """Session-history fullness, where the server reports it apart from the library."""
-    ratio = memory.get("session_usage_ratio")
-    if isinstance(ratio, (int, float)) and ratio >= 0:
-        return ratio
-    used, limit = _count(memory.get("session_tokens")), _count(memory.get("session_limit_tokens"))
-    return used / limit if used is not None and limit else None
+def held_memory(summary: dict, model: str | None = None) -> tuple[dict | None, str | None]:
+    """The memory a conversation's status shows, and the model it is on: the model's own store where the summary
+    reports one per model, else the workspace's."""
+    for row in summary.get("models") or []:
+        if isinstance(row, dict) and model and row.get("id") == model:
+            own = memory_view(row.get("memory"))
+            if own is not None and own["available"]:
+                return own, _model_name(row)
+    return memory_view(summary.get("memory")), None
 
 
 def sleep_lines(view: dict | None, console: str | None = None) -> list[str]:
@@ -102,6 +122,30 @@ def sleep_lines(view: dict | None, console: str | None = None) -> list[str]:
     return lines
 
 
+def memory_notice(summary: dict, console: str | None = None) -> tuple[int, str | None]:
+    """The workspace memory's warning, in core's notice words, with where to act: (level, line). A server where idle
+    conversations sleep warns for a full library and for a full conversation memory, which none could sleep to make
+    room in (level 2); one shared pool warns from 90 % (1) and when full (2). (0, None) when there is nothing to say."""
+    memory = memory_view(summary.get("memory"))
+    link = console or (summary.get("links") or {}).get("console") or CONSOLE
+    if memory is None or not memory["available"]:
+        return 0, None
+    if memory["session"] is not None:
+        if not memory["full"] and memory["session"]["fraction"] >= SESSION_FULL:
+            return 2, ("Memory is full. Nothing idle could sleep to make room. Delete or unpin a conversation, or add "
+                       f"memory. Open the console: {link}")
+        if not memory["full"]:
+            return 0, None
+        return 2, f"Your library is full. Remove a collection you no longer need, or add memory. Open the console: {link}"
+    if memory["full"]:
+        return 2, ("Workspace memory is full. New messages can't be saved until you free up space. "
+                   f"Open the console: {link}")
+    if memory["fraction"] >= 0.9:
+        return 1, (f"Workspace memory is {format_percent(memory['fraction'])} full. {format_tokens(memory['used'])} of "
+                   f"{format_tokens(memory['limit'])} used across all conversations and knowledge. Open the console: {link}")
+    return 0, None
+
+
 def _ends(summary: dict, now: float | None) -> str | None:
     """When the connection ends, in its last two weeks."""
     expires = _count((summary.get("connection") or {}).get("expires_at"))
@@ -120,51 +164,93 @@ def _name_of(summary: dict, model_id: str) -> str:
     return model_id
 
 
-def status_text(summary: dict, *, conversation: str | None = None, main: str | None = None,
-                moved_from: str | None = None, now: float | None = None, sleep: dict | None = None) -> str:
-    """What `/adaptiq status` says: the essentials on the first line, then the models.
+def _memory_part(memory: dict | None, on: str | None) -> str | None:
+    """The memory on the status line's first line (core's statusText)."""
+    if memory is None or not memory["available"]:
+        return None
+    history = "" if memory["session"] is None else f", conversations {format_percent(memory['session']['fraction'])}"
+    return (f"library {format_tokens(memory['used'])} of {format_tokens(memory['limit'])} "
+            f"({format_percent(memory['fraction'])}){history}{f' on {on}' if on else ''}")
 
-    `conversation` is "saved" or "private" inside a conversation, `main` the AdaptiqAI model Hermes
-    starts on, `moved_from` the main model that had no lanes any more, `sleep` the session-memory view.
+
+def conversation_part(conversation: dict) -> str:
+    """This conversation on the status line: its memory, whether it saves, and the knowledge it uses."""
+    tokens = conversation.get("memory_tokens")
+    held = "not saved yet" if tokens is None else f"{format_tokens(tokens)} in memory"
+    knowledge = conversation.get("knowledge") or 0
+    return (f"this conversation {held}, {'saving' if conversation.get('remember', True) else 'private'}"
+            f"{f', {knowledge} knowledge' if knowledge else ''}")
+
+
+def unconnected_text(phase: str, user_code: str | None = None, command: str = "/adaptiq") -> str:
+    """The status when Hermes is not connected: signing in, expired, or never connected."""
+    if phase == "signing-in":
+        return f"Waiting for approval in your browser. Code: {user_code or ''}"
+    said = "Your AdaptiqAI sign-in expired." if phase == "expired" else "Not connected to AdaptiqAI."
+    return f"{said} Run {command} signin."
+
+
+def status_text(summary: dict, *, conversation: dict | None = None, model: str | None = None,
+                main: str | None = None, moved_from: str | None = None, now: float | None = None,
+                sleep: dict | None = None, api_key: bool = False, command: str = "/adaptiq") -> str:
+    """What `/adaptiq status` says (core's statusText): the essentials on the first line, in order, then the models.
+
+    `conversation` is this conversation on AdaptiqAI (`memory_tokens`, `remember`, `knowledge`), `model` the model it
+    runs on, `main` the AdaptiqAI model Hermes starts on, `moved_from` the main model that left the workspace,
+    `sleep` the session-memory view, `api_key` whether the connection is an API key rather than this computer's
+    sign-in.
     """
     workspace = (summary.get("workspace") or {}).get("label") or "your workspace"
-    first = [f"AdaptiqAI: connected to {workspace}"]
-    if conversation:
-        first.append(f"this conversation is {conversation}")
-    memory = summary.get("memory") or {}
-    if _memory_text(memory) and _history(memory) is not None:
-        # used/limit are the library; session history has its own budget beside it.
-        first.append(f"library {_memory_text(memory)}")
-        first.append(f"conversations {format_percent(_history(memory))}")
-    elif _memory_text(memory):
-        first.append(f"memory {_memory_text(memory)}")
+    first = [f"Connected to {workspace}{' (API key)' if api_key else ''}"]
+    if conversation is not None:
+        first.append(conversation_part(conversation))
+    memory, on = held_memory(summary, model)
+    if _memory_part(memory, on):
+        first.append(_memory_part(memory, on))
     lines = [" · ".join(first)]
-    models = [model for model in summary.get("models") or [] if isinstance(model, dict)]
+    models = [row for row in summary.get("models") or [] if isinstance(row, dict)]
     if models:
-        lines.extend(_model_line(model, main) for model in models)
+        lines.extend(_model_line(row, main) for row in models)
     else:
-        lines.append("No models yet. /adaptiq models shows the models you can get.")
+        lines.append(f"No models yet. Open the AdaptiqAI console with {command} open.")
+    if memory is not None and memory["available"] and memory["conversations"] is not None:
+        lines.append(f"Memory split: conversations {format_tokens(memory['conversations'])}, "
+                     f"knowledge {format_tokens(memory['knowledge'])}")
     if moved_from and main:
         lines.append(f"Your main model was {_name_of(summary, moved_from)}, which is no longer in your workspace. "
                      f"It is {_name_of(summary, main)} now.")
-    conversations, knowledge = _count(memory.get("conversations_tokens")), _count(memory.get("knowledge_tokens"))
-    if memory.get("available") and conversations is not None and knowledge is not None and _history(memory) is None:
-        lines.append(f"Memory split: conversations {format_tokens(conversations)}, knowledge {format_tokens(knowledge)}")
-    if _history(memory) is not None:  # only a server that reports history apart puts conversations to sleep
+    if memory is not None and memory["available"] and memory["session"] is not None:
+        # Only a server that reports history apart puts idle conversations to sleep.
         lines.extend(sleep_lines(sleep, (summary.get("links") or {}).get("console")))
+    warning = memory_notice(summary)[1]
+    if warning:
+        lines.append(warning)
     if _ends(summary, now):
-        lines.append(f"This connection ends {_ends(summary, now)}. /adaptiq login renews it.")
+        lines.append(f"This connection ends {_ends(summary, now)}. {command} signin renews it.")
     return "\n".join(lines)
 
 
-def view(summary: dict, *, main: str | None = None, now: float | None = None) -> dict:
-    """The account as Hermes Desktop's settings page shows it: the same facts as `/adaptiq status`."""
-    models = [model for model in summary.get("models") or [] if isinstance(model, dict)]
+def view(summary: dict, *, main: str | None = None, now: float | None = None, api_key: bool = False,
+         sleep: dict | None = None) -> dict:
+    """The account as Hermes Desktop's settings page and status chip show it: the same facts as `/adaptiq status`,
+    and the notices it raises (the memory warning, sleeping conversations)."""
+    models = [row for row in summary.get("models") or [] if isinstance(row, dict)]
+    memory = memory_view(summary.get("memory"))
     ends = _ends(summary, now)
+    held = memory is not None and memory["available"]
+    level, warning = memory_notice(summary)
     return {
+        "warning": {"level": level, "text": warning} if warning else None,
+        "sleeping": (sleep_lines(sleep, (summary.get("links") or {}).get("console"))
+                     if held and memory["session"] is not None else []),
         "workspace": (summary.get("workspace") or {}).get("label") or "your workspace",
-        "memory": _memory_text(summary.get("memory") or {}),
-        "models": [{"id": model.get("id"), "name": str(model.get("display_name") or model.get("id")),
-                    "detail": " · ".join(_model_detail(model, main))} for model in models],
+        "api_key": api_key,
+        "memory": _memory_part(memory, None),
+        "used": memory["used"] if held else None,
+        "limit": memory["limit"] if held else None,
+        "split": (f"Conversations {format_tokens(memory['conversations'])}, knowledge {format_tokens(memory['knowledge'])}"
+                  if held and memory["conversations"] is not None else None),
+        "models": [{"id": row.get("id"), "name": _model_name(row), "detail": _model_detail(row, main).lstrip(" ·")}
+                   for row in models],
         "ends": f"This connection ends {ends}." if ends else None,
     }
