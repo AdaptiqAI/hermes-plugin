@@ -96,6 +96,11 @@ ORIGINAL_BYTES = 16 * 1024 * 1024
 KNOWN_CHARS = 32 * 1024 * 1024
 # The source types the engine gives as a table, one row a line (CSV, TSV): their originals hold the true cells.
 TABLE_TYPES = frozenset({"spreadsheet"})
+# A delimited table by its name, whose columns contents shows; at most COLUMN_READS a page, one request apiece.
+DELIMITED_NAME = re.compile(r"\.(csv|tsv)$", re.IGNORECASE)
+COLUMN_READS = 12
+# How many collections status and a refused read list: the newest, each with its description.
+COLLECTIONS_LISTED = 30
 # What JavaScript's \s takes for a space, as core's expressions split and match by it: Python's own adds \x1c-\x1f
 # and \x85, and leaves out \ufeff. And what its "." takes: any character but a line's end.
 _JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
@@ -249,7 +254,8 @@ KNOWLEDGE = {
             "query": {"type": "string", "description": QUERY_WORDS},
             "more": {"type": "boolean", "description": "For search, contents and open: the next results."},
             "name": {"type": "string", "description": "For use and stop: the collection's name as search or status "
-                     "shows it. For contents, find and open: which collection used here (default: all of them)."},
+                     "shows it. For contents, find and open: which collection (default: all used here); one not "
+                     "used here yet is used first."},
             "document": {"type": "string", "description": "For open: the document as contents or find shows it. "
                          "For find: the documents to look in, which find then lists in full, page by page: one, "
                          'several with commas between ("01_Afregning.json, 02_Afregning.json"), or the start or a '
@@ -263,7 +269,8 @@ KNOWLEDGE = {
                        "these fields of each record, one record per line, to go through many at once: JSON keys, the "
                        "words before a colon in a text record, a CSV or TSV table's columns, or the words a number "
                        'stands next to in a sentence (rejected units in "21 rejected units"). Two names with a minus '
-                       "between (paid-due) give the days from one date to the other, or one number less the other."},
+                       "between (paid-due) give the days from one date to the other, the minutes from one time to the "
+                       "other (a date with a time of day), or one number less the other."},
             "sum": {"type": "array", "items": {"type": "string"}, "description": "For find with document: fields to "
                     "add up over every record found, on every page (amounts, lengths, quantities, or days between two "
                     "dates written as in fields): exact totals, instead of adding the numbers yourself. For a count or "
@@ -491,6 +498,18 @@ FAILURE_SESSIONS = 64
 def stop_words(tool: str) -> str:
     """The end of a tool's failure: not to call again in this turn, and what to tell the person (core's stopWords)."""
     return STOP + AFTER.get(tool, AFTER["adaptiq_knowledge"])
+
+
+class _NotUsedHere(knowledge.KnowledgeError):
+    """A read the conversation has no collection for: the one named is not used here, or none is (core's
+    NotUsedHere). The knowledge tool uses the one named, or names the collections there are; the message is what the
+    reading alone says. `asked` is the name as the agent gave it, or None; `none` is true when the conversation reads
+    no ready collection, nor do the conversations added here."""
+
+    def __init__(self, message: str, asked: str | None, none: bool) -> None:
+        super().__init__(message)
+        self.asked = asked
+        self.none = none
 
 
 class _OutOfReach(knowledge.KnowledgeError):
@@ -827,6 +846,20 @@ def cells_of(row: str, delimiter: str) -> list[str]:
         at += 1
     cells.append(cell)
     return [value.strip(_JS_TRIMMED) for value in cells]
+
+
+def columns_in(start: str) -> list[str]:
+    """A delimited table's columns, from the start of the engine's text: heading lines, then the header row, cut at
+    commas (" | ") as the engine cuts every row (core's columnsIn). None when the first row is not a header of two
+    or more."""
+    for raw in start.split("\n")[:12]:
+        line = raw.strip(_JS_TRIMMED)
+        if not line or line.startswith("#") or line.startswith("Source type:"):
+            continue
+        row = line.replace(" | ", ",")
+        cells = cells_of(row, _delimiter_of(row))
+        return cells if len(cells) >= 2 and all(cells) else []
+    return []
 
 
 def _delimiter_of(header: str) -> str:
@@ -1167,16 +1200,44 @@ def _to_fixed(value: float, digits: int) -> str:
                                                                  context=_FIXED), "f")
 
 
+# A date, or a date and a time, as ISO writes it: "2043-03-14", "2043-03-14T08:12", "2043-03-14 08:12:05+01:00"
+# (core's MOMENT).
+_MOMENT = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:[.,]([0-9]+))?)?)?"
+                     r"\s*(Z|[+-][0-9]{2}:?[0-9]{2})?")
+
+
+def _moment_of(text: str) -> tuple[float, bool] | None:
+    """A date's or a time's minutes, at its offset if it names one, else as UTC, and whether it has a time of day
+    (core's momentOf); None when it is no real date."""
+    found = _MOMENT.fullmatch(text.strip(_JS_TRIMMED))
+    if found is None:
+        return None
+    day = _day(_DATE.fullmatch(f"{found.group(1)}-{found.group(2)}-{found.group(3)}"))
+    hour, minute, second = (int(found.group(at) or 0) for at in (4, 5, 6))
+    if day is None or hour > 23 or minute > 59 or second > 59:
+        return None
+    zone = found.group(8)
+    offset = (0 if zone is None or zone == "Z"
+              else (-1 if zone.startswith("-") else 1) * (int(zone[1:3]) * 60 + int(zone[-2:])))
+    fraction = float(f"0.{found.group(7)}") if found.group(7) else 0.0
+    return day * 1440 + hour * 60 + minute + (second + fraction) / 60 - offset, found.group(4) is not None
+
+
 def _difference(left: str | None, right: str | None, table: dict | None = None) -> str | None:
     """One field's value less another's (core's difference): the days between two dates (each all of its value,
-    YYYY-MM-DD, a day the calendar has), or the difference of two numbers. None when the two are not both dates or
-    both numbers."""
+    YYYY-MM-DD, a day the calendar has), the minutes between two times (each a date with a time of day: an alarm
+    acknowledged 17 minutes after it was raised), or the difference of two numbers. None when the two are not both
+    dates or both numbers."""
     if left is None or right is None:
         return None
-    first, second = _DATE.fullmatch(left), _DATE.fullmatch(right)
+    first, second = _moment_of(left), _moment_of(right)
     if first is not None and second is not None:
-        days = _day(first), _day(second)
-        return None if days[0] is None or days[1] is None else str(days[0] - days[1])
+        # A date and a time of day are not alike: a day is no moment of it, so they give no difference.
+        if first[1] != second[1]:
+            return None
+        if first[1]:
+            return _number_text(float(f"{first[0] - second[0]:.15g}"))
+        return str(round((first[0] - second[0]) / 1440))
     if table is not None:
         minuend, subtrahend = _table_number(left, table["delimiter"]), _table_number(right, table["delimiter"])
         return (None if minuend is None or subtrahend is None
@@ -1537,7 +1598,7 @@ def _records(docs: list[dict], hits: list[list[int]], query: str) -> list[dict]:
                 start, end = found_object["start"], found_object["end"]
                 at = next((index for index, line in enumerate(doc["lower"][start - 1:end]) if needle in line), 0)
                 typed = fields_of_json(found_object)
-                records.append({"doc": doc, "hit": start + at, "table": None, "typed": typed,
+                records.append({"doc": doc, "hit": start + at, "table": None, "typed": typed, "object": found_object,
                                 "record": {"start": start, "end": end, "whole": True, "lines": {}},
                                 "names": [key for key, _ in json_records.entries(found_object["value"])],
                                 "read": lambda field, typed=typed: (lambda value: None if value is None else value[0])(
@@ -2119,6 +2180,34 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                     f"{ADD_KNOWLEDGE}")
         return f"- {_quoted(item['name'])}: {_state(item)}{', used in this conversation' if item['selected'] else ''}"
 
+    def described_line(item: dict) -> str:
+        """A collection's line with its description: what an agent chooses by, since names alone left it guessing."""
+        return knowledge_line(item) + (" — " + " ".join(item["preview"].split())[:200] if item.get("preview") else "")
+
+    def usable_here(model: str | None, selected: frozenset) -> list[str]:
+        """The collections the conversation's model can use, newest first, each with its description, up to
+        COLLECTIONS_LISTED (core's usableHere): none when the library has none or could not be read."""
+        if not model:
+            return []
+        try:
+            page = library(model, "", None, selected)
+        except Exception:  # noqa: BLE001 - what was asked is still said
+            return []
+        usable = [item for item in page["items"] if item["kind"] == "collection" and item["fits"]]
+        more = len(usable) > COLLECTIONS_LISTED or page["has_more"]
+        return [*map(described_line, usable[:COLLECTIONS_LISTED]), *(["More: search with no words."] if more else [])]
+
+    def start(conversation: str, model: str, item: dict) -> str:
+        """Starts using a collection here, or says why it can't be: what use answers."""
+        if item["readiness"] == "failed":
+            why = knowledge.failure(item["memory_id"], model)
+            _fail(f"{_quoted(item['name'])} could not be built, so it cannot be used"
+                  f"{'' if why is None else ': ' + build_failure(why)}.")
+        if item["readiness"] != "ready":
+            _fail(f"{_quoted(item['name'])} is {_state(item)}; it can be used once it is ready.")
+        knowledge.use(conversation, model, item["memory_id"], True)
+        return f"{_quoted(item['name'])} is now used in this conversation."
+
     def collections_of_conversations(view: dict) -> list[str]:
         """The collections the earlier conversations added to this one read and this one does not: they are not
         read here until it uses them (core's collectionsOfConversations). Told only that two earlier conversations
@@ -2149,17 +2238,20 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
     def used_here(view: dict, name: str) -> list[dict]:
         """The ready collections used here that a name means, or all of them."""
         used = ready_here(view["knowledge"])
+        asked = name if name.strip() else None
         if not used:
             theirs = collections_of_conversations(view)
-            _fail(f"This conversation uses no ready collection. {their_collections(theirs)}" if theirs
-                  else "This conversation uses no ready collection. Find one with search and use it first.")
-        if not name.strip():
+            raise _NotUsedHere(f"This conversation uses no ready collection. {their_collections(theirs)}" if theirs
+                               else "This conversation uses no ready collection. Find one with search (with no words it lists them all) and use it first.",
+                               asked, not theirs)
+        if asked is None:
             return used
         wanted = same_name(name)
         found = ([item for item in used if same_name(item["name"]) == wanted]
                  or [item for item in used if wanted in same_name(item["name"])])
         if not found:
-            _fail(f"No collection used here is called {_quoted(name)}. Used here: {_names(used)}.")
+            raise _NotUsedHere(f"No collection used here is called {_quoted(name)}. Used here: {_names(used)}.",
+                               asked, False)
         return found
 
     def listing(model: str, item: dict, offset: int) -> dict:
@@ -2176,6 +2268,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         lines = []
         if not used and not preparing:
             lines.append("This conversation uses no saved knowledge.")
+            # Told only "uses none", agents searched next, in 154 of 325 captured conversations (2026-11-14): the ones
+            # there are follow.
+            there = usable_here(view.get("model") or model_of(session), frozenset())
+            if there:
+                lines += ["The collections there are, newest first (contents, find and open with a name use it here):",
+                          *there]
         else:
             parts = [f"{_quoted(item['name'])} ({_state(item)}{reading_note(item) if item['readiness'] == 'ready' else ''})"
                      for item in used]
@@ -2209,7 +2307,13 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                     used = knowledge.read_here(conversation, model)
                 except knowledge.KnowledgeError:
                     used = []
-            return search_miss(query, used)
+            # A miss that names no collection left agents guessing names until they gave up (2026-11-14).
+            try:
+                there = [item for item in library(model, "", None, selected)["items"] if item["kind"] == "collection"]
+            except Exception:  # noqa: BLE001 - the miss is still said
+                there = []
+            miss = search_miss(query, used)
+            return "\n".join([miss, "The collections there are, newest first:", *map(described_line, there)]) if there else miss
         return "\n".join([f"Saved knowledge{f' matching {_quoted(query)}' if query else ''}, newest first:",
                           *map(knowledge_line, items), *(["More: search again with more: true."] if page["has_more"] else [])])
 
@@ -2240,11 +2344,55 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 continue
             lines.append(f"{_quoted(item['name'])}: {page['total']} documents{reading_note(item)}. "
                          f"Documents {offset + 1}-{offset + len(page['documents'])}:")
-            lines += series.contents_lines(page["documents"],
-                                           lambda family, documents=page["documents"]: _kin_pattern(documents, family))
+            lines += with_columns(model, item, page["documents"], series.contents_lines(
+                page["documents"], lambda family, documents=page["documents"]: _kin_pattern(documents, family)))
             if page["next_offset"] is not None:
                 lines.append("More: contents again with more: true.")
         return "\n".join(lines)
+
+    def with_columns(model: str, item: dict, documents: list[dict], listed: list[str]) -> list[str]:
+        """contents' lines, each table that leads a line with its columns (core's withColumns): agents opened a table
+        only to see its columns before they could find in it (28 of 325 conversations, MiMo eval 2026-11-14). A
+        series' line shows the columns of its first document. Columns already read for open or find are reused."""
+        leads = [next((document for document in documents if DELIMITED_NAME.search(document["path"])
+                       and (line.startswith(f"- {document['path']} (") or line.startswith(f"- {document['path']} to "))),
+                      None) for line in listed]
+        wanted = list({document["path"]: document for document in leads if document is not None}.values())[:COLUMN_READS]
+        if not wanted:
+            return listed
+        try:
+            sources = knowledge.source_list(model, item["memory_id"])
+        except knowledge.KnowledgeError:
+            return listed
+
+        def columns_of(document: dict) -> list[str]:
+            source = next((entry for entry in sources if entry["name"] == document["path"]), None)
+            if source is None or source["type"] not in TABLE_TYPES:
+                return []
+            key = key_of(item, document)
+            with lock:
+                held = known_many.get(key)
+                read = known.get(key) or (held[0] if held is not None else None)
+            if read is not None and read.get("table"):
+                return read["table"]["cells"]
+            try:
+                return columns_in(knowledge.source_text(model, item["memory_id"], source["id"])["text"])
+            except knowledge.KnowledgeError:
+                return []
+
+        with ThreadPoolExecutor(max_workers=min(len(wanted), 4)) as pool:
+            columns = dict(zip((document["path"] for document in wanted), pool.map(columns_of, wanted)))
+        out = []
+        for line, document in zip(listed, leads):
+            cells = columns.get(document["path"]) if document is not None else None
+            if not cells or len(cells) < 2:
+                out.append(line)
+                continue
+            named = ", ".join(cells)
+            shown = named[:600] + "…" if len(named) > 600 else named
+            out.append(f"{line[:-1]}; columns: {shown})" if line.endswith(" lines)")
+                       else f"{line} Columns of {document['path']}: {shown}.")
+        return out
 
     def documents_of(model: str, item: dict) -> list[dict]:
         """The documents of a collection, up to twenty pages of its list (core's documentsOf)."""
@@ -2473,7 +2621,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         span = (head["record"]["start"], head["record"]["end"]) if head["record"] else (head["hit"], head["hit"])
         named = head["names"] if "names" in head else [name for name, _ in pairs_of(*span, _text_of(head["doc"]),
                                                                                      head["table"])]
-        minus = " (a-b is the days between two dates, or one number less another)"
+        minus = " (a-b is the days between two dates, the minutes between two times, or one number less another)"
         notes = ([f"No record found here has {' or '.join(map(_quoted, missing))}"
                   f"{minus if any('-' in field for field in missing) else ''}. The fields of the first one: "
                   f"{', '.join(named) if named else 'none find can name'}."] if missing else [])
@@ -2543,7 +2691,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             entry = records[after]
             doc, hit, around, table = entry["doc"], entry["hit"], entry["record"], entry["table"]
             text = _text_of(doc)
-            matched = text(hit)
+            # A JSON record that is part of its line is shown as itself, never as the line (core's listRecords): one
+            # node of a network model written on one line of 148,362 characters was never shown (2026-11-14).
+            found_object = entry.get("object")
+            alone = (json.dumps(found_object["value"], ensure_ascii=False, separators=(",", ":"))
+                     if found_object is not None and found_object["start"] == found_object["end"] else None)
+            matched = alone if alone is not None and len(alone) < len(text(hit).strip()) else text(hit)
             rows = [field_line(doc["path"], hit, around, text, fields, table, entry["read"]) if fields
                     else f"- {doc['path']}:{hit}: {f'{matched[:LINE_CHARS]}…' if len(matched) > LINE_CHARS else matched}"]
             if table is not None and not fields and id(table) not in shown_tables:
@@ -3002,6 +3155,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         key = f"{session}\nopen\n{key_of(item, document)}"
         # A line is read as the section it stands in, never past it: ten lines above a clause are the end of
         # another agreement, and the hundred after it are other clauses.
+        # Reading on, an agent often names the line again (core's show): the line a page was asked at, or the line it
+        # stopped inside, with more: true, is more of it, not the page again.
+        asked = line
+        held = page_at(key, more) if line is not None else None
+        if held is not None and (held.get("asked") == line or (held["at"] > 0 and held["line"] == line)):
+            asked, line = held.get("asked"), None
         section = section_at(read, line) if line is not None and line <= len(lines) else None
         # Where more reads on: a line, and a character of it.
         start = (page_at(key, more) if line is None else None) or {"line": 1, "at": 0}
@@ -3134,7 +3293,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         first, last, stop = shown_page["first"], shown_page["last"], shown_page["stop"]
         ends = last == len(lines) and stop is None
         # The end is kept too: another "more" says the document ends there, never shows its first page again.
-        page_next(key, {"line": last + 1, "at": 0} if stop is None else {"line": last, "at": stop})
+        page_next(key, {"line": last + 1, "at": 0, "asked": asked} if stop is None else {"line": last, "at": stop, "asked": asked})
         said = {"page": "", "section": "That is all of that section. ",
                 "own": "Those are its own lines, above its sections. ", "record": "That is the whole record. ",
                 "object": "That is the whole object. ", "row": "That is the whole row. "}[kind]
@@ -3207,29 +3366,52 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             if action == "search":
                 return search(session, conversation, model, view, args, selected)
             # Each read says when it was asked again and nothing is new.
-            if action == "contents":
-                return told(session, action, args, contents(session, model, view, args))
-            if action == "find":
-                return told(session, action, args, find(session, model, view, args))
-            if action == "open":
-                return told(session, action, args, open_document(session, model, view, args))
+            if action in ("contents", "find", "open"):
+                return told(session, action, args, read(session, conversation, model, view, selected, args))
             use = action == "use"
             item = named(model, view, str(args.get("name") or ""), not use, selected)
             if (item["memory_id"] in selected) == use:
                 return (f"{_quoted(item['name'])} is already used in this conversation." if use
                         else f"{_quoted(item['name'])} is not used in this conversation.")
-            if use and item["readiness"] == "failed":
-                why = knowledge.failure(item["memory_id"], model)
-                _fail(f"{_quoted(item['name'])} could not be built, so it cannot be used"
-                      f"{'' if why is None else ': ' + build_failure(why)}.")
-            if use and item["readiness"] != "ready":
-                _fail(f"{_quoted(item['name'])} is {_state(item)}; it can be used once it is ready.")
-            knowledge.use(conversation, model, item["memory_id"], use)
-            if not use:
-                return f"{_quoted(item['name'])} is no longer used in this conversation. Nothing was deleted."
-            return f"{_quoted(item['name'])} is now used in this conversation."
+            if use:
+                return start(conversation, model, item)
+            knowledge.use(conversation, model, item["memory_id"], False)
+            return f"{_quoted(item['name'])} is no longer used in this conversation. Nothing was deleted."
 
         return _run(work)
+
+    def read(session: str, conversation: str, model: str, view: dict, selected: frozenset, args: dict) -> str:
+        """A read (contents, find, open) of a collection the conversation does not use yet uses it first, and a read
+        with no collection to read names the ones there are (core's read). Told to search and use one first, agents
+        spent two to four steps on it, in 173 of 325 captured conversations (MiMo eval, 2026-11-14)."""
+        reader = {"contents": contents, "find": find, "open": open_document}[args.get("action")]
+        try:
+            return reader(session, model, view, args)
+        except _NotUsedHere as error:
+            def refused(said: str):
+                there = usable_here(model, selected) if error.none else []
+                if not there:
+                    raise error
+                _fail("\n".join([said, "The collections there are, newest first:", *there]))
+
+            if error.asked is None:
+                refused("This conversation uses no ready collection. Name the one to read: contents, find and open "
+                        "use it here.")
+            try:
+                item = named(model, view, error.asked, False, selected)
+            except knowledge.KnowledgeError as missing:
+                if not str(missing).startswith("No saved knowledge is called"):
+                    raise
+                if not error.none:
+                    raise error from None
+                refused(f"No saved collection is called {_quoted(error.asked)}, and this conversation uses none.")
+            if item["memory_id"] in selected:
+                if item["readiness"] != "ready":
+                    _fail(f"{_quoted(item['name'])} is {_state(item)}; it can be read once it is ready.")
+                raise error
+            started = start(conversation, model, item)
+            view = knowledge.conversation_view(conversation, model_of(session))
+            return f"{started}\n{reader(session, model, view, args)}"
 
     @_guarded("adaptiq_memory")
     def memory_tool(args: dict, session_id: str = "", **_) -> str:
