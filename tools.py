@@ -25,6 +25,7 @@ from . import adaptiq_core as core
 from . import json_records
 from . import knowledge
 from . import record
+from . import series
 
 TOOLSET = "adaptiq"
 
@@ -206,6 +207,8 @@ SPEAK = ("Speak to the person in their own language, only about what matters to 
 TURN_NOTE = "AdaptiqAI Knowledge this conversation reads: "
 # How find ends (core's reading.ts): the lines it gave, or plainly that it found none.
 FOUND = "These are the exact lines. To read a whole document, open it."
+# Said after a find that left out a document's Columns line, as the one above holds for it.
+COLUMNS_ABOVE = "Rows of a document with no Columns line of its own have the columns last shown above them."
 NOTHING_FOUND = ("Nothing was found, so there are no lines to answer from. Try other or fewer words, or take contents to "
                  "see the documents.")
 # What the knowledge tool says of find_in_conversation, right after FIND_FIRST (core's FIND_IN_CONVERSATION, plugins
@@ -1484,25 +1487,20 @@ def _table_at(doc: dict, line: int) -> dict | None:
 
 
 def _as_written(match: dict, read: dict | None) -> dict:
-    """A line the engine's search found in a table, and the lines around it, as the table's original writes them
-    (core's find)."""
+    """A row the engine's search found in a table, as the table's original writes it, alone (core's find): the rows
+    beside it are other records. Asked for one customer's rentals, an agent got 25 rows and 50 rows of other
+    customers, 16,756 characters in all, and the turn no longer fitted the model."""
     if read is None:
         return match
     lines = read["lines"]
-
-    def row(line: int, given: str) -> str:
-        return lines[line - 1].strip() if 1 <= line <= len(lines) else given
-
-    before = match["before"]
-    return {**match, "text": row(match["line"], match["text"]),
-            "before": [row(match["line"] - len(before) + index, text) for index, text in enumerate(before)],
-            "after": [row(match["line"] + 1 + index, text) for index, text in enumerate(match["after"])]}
+    line = match["line"]
+    return {**match, "text": lines[line - 1].strip() if 1 <= line <= len(lines) else match["text"],
+            "before": [], "after": []}
 
 
 # What JavaScript's trim takes off a text's ends, as core trims a line: a byte order mark too, never a file separator
 # as Python's strip does.
-_JS_TRIMMED = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200B)))
-               + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_TRIMMED = record.JS_TRIMMED
 
 
 def _text_of(doc: dict):
@@ -2242,7 +2240,8 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 continue
             lines.append(f"{_quoted(item['name'])}: {page['total']} documents{reading_note(item)}. "
                          f"Documents {offset + 1}-{offset + len(page['documents'])}:")
-            lines += [f"- {entry['path']} ({entry['lines']} lines)" for entry in page["documents"]]
+            lines += series.contents_lines(page["documents"],
+                                           lambda family, documents=page["documents"]: _kin_pattern(documents, family))
             if page["next_offset"] is not None:
                 lines.append("More: contents again with more: true.")
         return "\n".join(lines)
@@ -2804,11 +2803,19 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             records = knowledge.records(model, item["memory_id"], matches)
             shown: list[tuple[str, int, int]] = []
             columns_shown: set[str] = set()
+            # A year of monthly exports has one header: said for the first document, it holds for the next ones too.
+            columns_above: str | None = None
+            columns_reused = False
             for match in matches:
                 table = (tables.get(match["path"]) or {}).get("table")
                 if table is not None and match["path"] not in columns_shown:
                     columns_shown.add(match["path"])
-                    lines.append(f"- {match['path']}: {columns_line(table)}")
+                    columns = columns_line(table)
+                    if columns == columns_above:
+                        columns_reused = True
+                    else:
+                        columns_above = columns
+                        lines.append(f"- {match['path']}: {columns}")
                 if any(at == match["path"] and start <= match["line"] <= stop for at, start, stop in shown):
                     lines.append(f"- {match['path']}:{match['line']}: {match['text']} (in the record above)")
                     continue
@@ -2823,9 +2830,21 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                     lines += [f"  {at}: {whole['lines'][at]}" for at in range(whole["start"], whole["end"] + 1)
                               if whole["lines"].get(at)]
                     continue
+                # A record on one line has other records beside it: asked for one machine's service cases, an agent
+                # got 8 of them and 16 of other machines. A line beside it that is no record of its own (the object or
+                # the list it is in) is still shown.
+                one_line = json_records.is_structured_json(match["path"]) and record.whole_object(match["text"])
+
+                def beside(text: str) -> bool:
+                    return text != "" and not (one_line and record.whole_object(text))
+
                 before = match["before"]
-                lines += [f"  {match['line'] - len(before) + index}: {text}" for index, text in enumerate(before) if text]
-                lines += [f"  {match['line'] + 1 + index}: {text}" for index, text in enumerate(match["after"]) if text]
+                lines += [f"  {match['line'] - len(before) + index}: {text}" for index, text in enumerate(before)
+                          if beside(text)]
+                lines += [f"  {match['line'] + 1 + index}: {text}" for index, text in enumerate(match["after"])
+                          if beside(text)]
+            if columns_reused:
+                lines.append(COLUMNS_ABOVE)
             if found["truncated"]:
                 shown_in = list(dict.fromkeys(match["path"] for match in found["matches"]))
                 holders = None if named else holders_of(model, item, pattern)

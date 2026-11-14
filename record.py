@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from . import json_records
+
 # The most lines a record is shown with; a longer one is shown in part.
 RECORD_LINES = 40
 # The lines the engine gives on each side of a found line, at most.
@@ -25,6 +27,26 @@ DISTINCT = 4
 def is_json_document(path: str) -> bool:
     """A JSON document's lines are shown with their record; a JSON Lines line is its own record already."""
     return path.lower().endswith(".json")
+
+
+# What JavaScript's trim takes off a text's ends, as core trims a line: a byte order mark too, never a file separator
+# as Python's strip does.
+JS_TRIMMED = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200B)))
+              + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def whole_object(text: str) -> bool:
+    """Whether a line is a whole JSON object by itself, its closing comma aside (core's wholeObject): a register
+    written one record a line (JSON Lines, or a list with an object a line)."""
+    line = text.strip(JS_TRIMMED)
+    line = line[:-1] if line.endswith(",") else line
+    if not line.startswith("{") or not line.endswith("}"):
+        return False
+    try:
+        json_records._parse(line)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 def literal(text: str) -> str:
