@@ -15,6 +15,7 @@ import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 SESSION_HEADER = "X-Adaptiq-Session-Id"
 # Asks the engine for `adaptiq.progress` frames while it prepares a conversation's memory (core's adapter): Hermes'
@@ -33,6 +34,21 @@ PARENT_HEADER = "X-Adaptiq-Parent-Session-Id"
 ROLE_HEADER = "X-Adaptiq-Session-Role"
 RELATION_HEADERS = frozenset({PARENT_HEADER.lower(), ROLE_HEADER.lower()})
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+
+
+def _version() -> str:
+    """The plugin's version, from the manifest Hermes loads it by; empty when it can't be read."""
+    try:
+        text = (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found = re.search(r"^version:\s*['\"]?([^'\"\s]+)", text, re.M)
+    return found.group(1) if found else ""
+
+
+# On every request the plugin makes or shapes, so AdaptiqAI can tell how each version fares.
+VERSION = _version()
+CLIENT = {"X-Adaptiq-Client": "adaptiqai-hermes-plugin" + (f"/{VERSION}" if VERSION else "")}
 
 
 def relation_headers(session_id: str, parent: str, role: str = "helper") -> dict:
@@ -182,13 +198,14 @@ def by_card(request: dict, row: dict | None, chosen: bool) -> dict:
 
 
 def shape(request: dict, turn: Turn | None) -> dict:
-    """The request with AdaptiqAI's session header and memory mode.
+    """The request with the plugin's name, AdaptiqAI's session header and memory mode.
 
     Pass `turn=None` for anything that is not a turn of a conversation.
     """
     shaped = dict(request)
     headers = {name: value for name, value in (request.get("extra_headers") or {}).items()
                if name.lower() not in SESSION_HEADER_ALIASES and name.lower() not in RELATION_HEADERS}
+    headers.update(CLIENT)
     body = dict(request.get("extra_body") or {})
     if turn is None:
         body[MEMORY_FIELD] = ephemeral("fork")

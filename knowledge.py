@@ -8,8 +8,12 @@ store of the model the conversation runs on.
 from __future__ import annotations
 
 import base64
+import contextlib
+import http.client
 import json
 import os
+import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -66,7 +70,7 @@ def _raw(method: str, path: str, model: str | None = None, body: dict | None = N
 def _call(method: str, path: str, model: str | None = None, body: dict | None = None,
           allow: tuple[int, ...] = (), headers: dict | None = None, timeout: float = 15) -> dict | None:
     """One knowledge call: the body, None for an allowed status, else a KnowledgeError."""
-    status, reply = _raw(method, path, model, body, headers, timeout)
+    status, reply = _answered(method, path, model, body, headers, timeout)
     if status in allow:
         return None
     if status >= 400:
@@ -78,6 +82,116 @@ def _call(method: str, path: str, model: str | None = None, body: dict | None = 
                              status=status,
                              missing_route=status == 405 or (status == 404 and bare in ("not found", "route not found")))
     return reply
+
+
+# Inside an agent tool's call, passing trouble is asked again before the agent hears of it (core's
+# tool-failures.ts): a 5xx, no answer in time or a dropped connection after 1 and then 3 seconds, within 15
+# seconds of the call's first failure; a conversation getting ready (425) after 5, 10 and 20 seconds, within
+# 40, as a model request waits for it. Only what is safe to send twice is sent again, and a model that is
+# offline is not waited for: it comes back in minutes. Hermes' requests keep no headers, so a Retry-After does
+# not lengthen these waits. Outside a tool's call (a turn's note, the account) every request is sent once.
+RETRY_WAITS = (1.0, 3.0)
+RETRY_WINDOW = 15.0
+READY_WAITS = (5.0, 10.0, 20.0)
+READY_WINDOW = 40.0
+OFFLINE_CODES = ("instance_unavailable", "session_route_unavailable")
+# What the engine calls a conversation or collection getting ready (core's READY_WORDS).
+READY_WORDS = ("preflightbusy", "preparing", "memorynotready", "upload_capacity")
+
+
+class Tries:
+    """One tool call's tries, shared by every request it sends (core's Tries)."""
+
+    def __init__(self, clock=time.monotonic, sleep=time.sleep) -> None:
+        self.clock = clock
+        self.sleep = sleep
+        self.first: float | None = None
+        # A request of this call failed every try it had: the others are not asked again.
+        self.lasted = False
+        # The call has ended: what it left running is sent once.
+        self.ended = False
+
+    def wait_after(self, ready: bool, tried: int) -> float | None:
+        """How long to wait before the next try, or None when the failure goes back to the call."""
+        if self.ended or self.lasted:
+            return None
+        now = self.clock()
+        if self.first is None:
+            self.first = now
+        waits, window = (READY_WAITS, READY_WINDOW) if ready else (RETRY_WAITS, RETRY_WINDOW)
+        if tried >= len(waits) or now + waits[tried] - self.first > window:
+            self.lasted = True
+            return None
+        return waits[tried]
+
+
+_calls = threading.local()
+
+
+@contextlib.contextmanager
+def calling(clock=time.monotonic, sleep=time.sleep):
+    """The requests of one agent tool's call: passing trouble is asked again in them (`_answered`)."""
+    outer = getattr(_calls, "tries", None)
+    tries = _calls.tries = Tries(clock, sleep)
+    try:
+        yield tries
+    finally:
+        tries.ended = True
+        _calls.tries = outer
+
+
+def getting_ready(status: int | None, named: str) -> bool:
+    """A conversation getting ready: a 425, or a 503 the engine names as such (core's gettingReady)."""
+    return status == 425 or (status == 503 and any(word in named.lower() for word in READY_WORDS))
+
+
+def _trouble(status: int, reply) -> str | None:
+    """`ready` for a conversation getting ready, `blip` for other passing trouble worth asking again within
+    seconds, None for an answer: a refusal, or a 503 that says why (a model offline, a memory service the gateway
+    gave up on), which comes back in minutes, not within a call. A bare 503 is a blip."""
+    detail = reply.get("detail") if isinstance(reply, dict) else None
+    error = reply.get("error") if isinstance(reply, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    kind = error.get("type") if isinstance(error, dict) else None
+    named = f"{kind or ''} {code or ''}"
+    if getting_ready(status, named):
+        return "ready"
+    if code in OFFLINE_CODES or (status == 503 and (named.strip() or "offline" in json.dumps(detail).lower())):
+        return None
+    if status in (408, 429) or (status >= 500 and status != 507):
+        return "blip"
+    return None
+
+
+def _answered(method: str, path: str, model: str | None = None, body: dict | None = None,
+              headers: dict | None = None, timeout: float = 15) -> tuple[int, dict]:
+    """`_raw`, asked again on passing trouble inside an agent tool's call. A reply cut off on the way is no
+    answer: AdaptiqAI could not be reached."""
+    tries = getattr(_calls, "tries", None)
+    safe = method in ("GET", "HEAD", "PUT", "DELETE") or any(name.lower() == "idempotency-key" for name in headers or {})
+    tried = 0
+    while True:
+        error: Exception | None = None
+        try:
+            status, reply = _raw(method, path, model, body, headers, timeout)
+            kind = _trouble(status, reply)
+        except KnowledgeError as caught:
+            if not caught.passing:
+                raise
+            error, kind = caught, "blip"
+        except http.client.HTTPException as caught:
+            error, kind = caught, "blip"
+        wait = tries.wait_after(kind == "ready", tried) if kind and safe and tries is not None else None
+        if wait is not None:
+            tries.sleep(wait)
+            tried += 1
+            if not tries.ended:
+                continue
+        if error is None:
+            return status, reply
+        if isinstance(error, KnowledgeError):
+            raise error
+        raise KnowledgeError("AdaptiqAI can't be reached right now.", passing=True) from error
 
 
 def _failure(status: int, reply) -> str:
@@ -173,21 +287,31 @@ def collection(memory: dict, selected: bool, target: str | None = None) -> dict:
     return item
 
 
+def _refusal(status: int, reply) -> KnowledgeError:
+    """A failed answer as `_call` raises it: its sentence, what AdaptiqAI answered, and whether another try may go
+    through, so the tools tell passing trouble from a refusal."""
+    detail = reply.get("detail") if isinstance(reply, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return KnowledgeError(_failure(status, reply), answer=" ".join(str(part) for part in (status, code) if part),
+                          passing=status in (408, 425, 429) or status >= 500 or code == "instance_unavailable",
+                          status=status)
+
+
 def conversation(session_id: str, model: str | None = None, timeout: float = 15) -> dict | None:
     """What AdaptiqAI keeps for a conversation, or None while it is not stored.
 
     The gateway sends a session call to the model the conversation is placed on. Where several models
     keep memory and it cannot tell (409), the conversation's own model is asked.
     """
-    status, reply = _raw("GET", _path(session_id), timeout=timeout)
+    status, reply = _answered("GET", _path(session_id), timeout=timeout)
     if status == 409 and model:
-        status, reply = _raw("GET", _path(session_id), model, timeout=timeout)
+        status, reply = _answered("GET", _path(session_id), model, timeout=timeout)
         if status == 409 and _not_on(reply, model):
             return None
     if status == 404:
         return None
     if status >= 400:
-        raise KnowledgeError(_failure(status, reply))
+        raise _refusal(status, reply)
     return reply
 
 
@@ -434,12 +558,12 @@ def _revision(session_id: str, model: str | None) -> int:
         if isinstance(revision, int):
             return revision
         if body is None:
-            status, reply = _raw("POST", "/sessions", model, {"session_id": session_id, "name": "Hermes conversation"})
+            status, reply = _answered("POST", "/sessions", model, {"session_id": session_id, "name": "Hermes conversation"})
             # 409: it exists after all (read again), or a refusal to say if the read still finds nothing.
             if status == 409:
                 refused = reply
             elif status >= 400:
-                raise KnowledgeError(_failure(status, reply))
+                raise _refusal(status, reply)
     if refused:
         raise KnowledgeError(_failure(409, refused))
     raise KnowledgeError("This conversation is not on AdaptiqAI yet. Send one message first.")
@@ -453,20 +577,37 @@ def use(session_id: str, model: str | None, memory_id: str, attach: bool) -> Non
         if attach:
             body.update({"activation_policy": "always", "availability_policy": "required",
                          "version_policy": "latest_ready"})
-        status, reply = _raw("PUT" if attach else "DELETE", path, model, body)
+        status, reply = _answered("PUT" if attach else "DELETE", path, model, body)
         if status < 400:
             return
         detail = reply.get("detail") if isinstance(reply.get("detail"), dict) else {}
         # A revision that moved in between is read again once; a collection on another model is not.
         if status == 409 and detail.get("code") != "model_mismatch" and attempt == 0:
             continue
-        raise KnowledgeError(_failure(status, reply))
+        raise _refusal(status, reply)
 
 
-def media_type(name: str) -> str:
-    """The media type for a file name; source code is plain text."""
+def is_text(content: bytes) -> bool:
+    """Whether a file's bytes are text: UTF-8 without a NUL byte, as git tells text from binary."""
+    if b"\0" in content:
+        return False
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def media_type(name: str, content: bytes | None = None) -> str:
+    """The media type for a file; source code and any other text are plain text. A text of another name (a
+    Containerfile, a Makefile, JSON Lines, a .env) sent as bytes was refused by the engine ("is not a supported source
+    type yet"), and the whole upload with it (core's mediaTypeOf)."""
     extension = os.path.splitext(name)[1].lower()
-    return MEDIA.get(extension) or ("text/plain" if extension in SOURCE_CODE else "application/octet-stream")
+    if extension in MEDIA:
+        return MEDIA[extension]
+    if extension in SOURCE_CODE:
+        return "text/plain"
+    return "text/plain" if content is not None and is_text(content) else "application/octet-stream"
 
 
 def unreadable(raw: str, real: str, blocked=None) -> str | None:
@@ -520,9 +661,9 @@ def sources(items: list[dict], cwd: str, collection: str, resolve=None, blocked=
                 raise KnowledgeError("These files are too large for one request. Use fewer or smaller files, "
                                      "or a repository link.")
             with open(real, "rb") as handle:
-                content = base64.b64encode(handle.read(FILES_LIMIT + 1)).decode()
+                data = handle.read(FILES_LIMIT + 1)
             out.append({"type": "file", "name": str(item.get("name") or os.path.basename(path))[:200],
-                        "media_type": media_type(path), "content_base64": content})
+                        "media_type": media_type(path, data), "content_base64": base64.b64encode(data).decode()})
         elif kind == "link":
             url = urllib.parse.urlsplit(str(item.get("url") or ""))
             if url.scheme != "https" or not url.hostname or url.username or url.password:

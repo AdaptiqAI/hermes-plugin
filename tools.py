@@ -82,11 +82,60 @@ OPEN_BEFORE = 10
 # How many characters open shows at once, and of one line: a longer one (a paragraph is shorter) is cut.
 OPEN_CHARS = 16_000
 LINE_CHARS = 2_000
-# The source types whose engine text is their original under a heading, and the largest original open reads.
-VERBATIM_TYPES = frozenset({"text", "code"})
-ORIGINAL_BYTES = 4 * 1024 * 1024
+# How many other sections open names beside the one it shows (a contract's clauses, a chapter's parts) or under it,
+# and how much of a heading it shows where it names one.
+BESIDE_SHOWN = 24
+HEADING_CHARS = 100
+# The source types whose engine text is their original under a heading (a repository's file in a fenced block under
+# it), and the largest original open reads: as large as a file the engine takes. At 4 MiB, a log of 10 MiB could be
+# read to its 24,000th character and no further.
+VERBATIM_TYPES = frozenset({"text", "code", "repository_file"})
+ORIGINAL_BYTES = 16 * 1024 * 1024
+# How many characters the documents kept for open hold in all: eight of 16 MiB would not fit a harness's memory.
+KNOWN_CHARS = 32 * 1024 * 1024
 # The source types the engine gives as a table, one row a line (CSV, TSV): their originals hold the true cells.
 TABLE_TYPES = frozenset({"spreadsheet"})
+# What JavaScript's \s takes for a space, as core's expressions split and match by it: Python's own adds \x1c-\x1f
+# and \x85, and leaves out \ufeff. And what its "." takes: any character but a line's end.
+_JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+DOT = "[^\n\r\u2028\u2029]"
+# A Markdown heading's line: "## Title", its closing hashes aside.
+ATX = re.compile(rf" {{0,3}}(#{{1,6}})[ \t]+([^{_JS_SPACE}]{DOT}*?)(?:[ \t]+#+)?[ \t]*\Z")
+# A line that underlines the paragraph above it as a heading: "===" for the first level, "---" for the second.
+SETEXT = re.compile(r" {0,3}(=+|-+)[ \t]*\Z")
+# A line that starts a block whose lines a setext heading cannot underline: a list item, a quote, a table's row or
+# rule, a comment. Its later lines belong to it until a blank line, as CommonMark reads a lazy continuation.
+BLOCK = re.compile(r" {0,3}(?:[-*+](?:[ \t]|\Z)|[0-9]{1,9}[.)](?:[ \t]|\Z)|>|\||<!--)"
+                   r"| {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*\Z")
+# A line of YAML front matter: a key, a list item, an indented line, a comment, or nothing; and a key.
+YAML_LINE = re.compile(r"(?:[A-Za-z0-9_.-]+[ \t]*:|[ \t]|-[ \t]|#|\Z)")
+YAML_KEY = re.compile(r"[A-Za-z0-9_.-]+[ \t]*:")
+# File endings of Markdown, and of what the gateway writes as Markdown: a PDF, a Word document, a deck, a workbook, a
+# web page.
+MARKDOWN_ENDINGS = re.compile(r"(?:md|markdown|mdx|mdown|mkd|mkdn|qmd|rmd)\Z", re.I)
+WRITTEN_AS_MARKDOWN = re.compile(r"(?:pdf|docx|pptx|xlsx|html?)\Z", re.I)
+# Files named by their kind, with no ending: a container's, make's, a CI's or a package manager's own files.
+NOT_MARKDOWN_NAMES = re.compile(r"(?:(?:docker|container|make|gnumake|jenkins|proc|gem|rake|vagrant|brew|pod|just|snake"
+                                r"|caddy|berks|guard|cap|earth|tilt)file|codeowners|build|workspace)\Z", re.I)
+# The numbers after a rotated log's ending (app.log.1): no ending.
+ROTATED = re.compile(r"(?:\.[0-9]+)+\Z")
+# Excel's first line naming a CSV's delimiter: "sep=;".
+SEP = re.compile(rf"sep=({DOT})\Z")
+# A character outside the basic plane: the core counts it as two, as JavaScript does.
+ASTRAL = re.compile("[\U00010000-\U0010ffff]")
+# A fence's first line, front matter's last, a closing fence, an indented line, a name's ending, and the fence the
+# engine puts a repository's file in.
+FENCE = re.compile(rf" {{0,3}}(`{{3,}}|~{{3,}})({DOT}*)\Z")
+FRONT_END = re.compile(rf"(?:---|\.\.\.)[{_JS_SPACE}]*\Z")
+CLOSER = re.compile(rf"`{{3,}}[{_JS_SPACE}]*\Z")
+INDENTED = re.compile(r" {4}|\t")
+ENDING = re.compile(r"\.([A-Za-z][A-Za-z0-9]{0,7})\Z")
+FENCE_OPENED = re.compile(r"(?:^|\n)(`{3,})[^`\n]*\n\Z")
+# JSON Lines; the lines of the engine's heading over a repository's file; a JSON text's strings, brackets and line
+# ends.
+JSON_LINES = re.compile(r"\.(?:jsonl|ndjson)\Z", re.I)
+SOURCE_LINE = re.compile(r"(?:Source|Path|Language): ")
+JSON_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[{}\[\]:,\n]')
 # How many documents' lines are kept for the next open or find: the most recent ones.
 DOCUMENTS_KEPT = 16
 # How many documents one find lists together: a year's months, a set of volumes.
@@ -150,9 +199,10 @@ READING_NOTE = ("A collection used here is in your memory, but a large one is re
                 "more: true reads on). Before you say something is not there, find it; for an overview, take contents "
                 "first. Answer from what these actions return, citing document:line as a result shows it, and never "
                 "name a document or a line no result showed.")
-# How the agent speaks about knowledge, the same in every tool. Hermes shows no readiness itself.
-SPEAK = ("Speak to the person in their own language, and only about what matters to them. "
-         "Never mention ids, operation ids, JSON, tool names, status checks or readiness codes.")
+# How the agent speaks about knowledge: said once, in the knowledge tool, as every request carries all three. Hermes
+# shows no readiness itself.
+SPEAK = ("Speak to the person in their own language, only about what matters to them; never mention ids, JSON, tool "
+         "names, status checks or readiness codes.")
 TURN_NOTE = "AdaptiqAI Knowledge this conversation reads: "
 # How find ends (core's reading.ts): the lines it gave, or plainly that it found none.
 FOUND = "These are the exact lines. To read a whole document, open it."
@@ -202,28 +252,25 @@ KNOWLEDGE = {
                          'several with commas between ("01_Afregning.json, 02_Afregning.json"), or the start or a '
                          "part of their names."},
             "line": {"type": "number", "description": "For open: the line to read around."},
-            "sort": {"type": "string", "description": "For find with document: the field to sort the records by, "
-                     "those of all the documents named as one list, smallest first, or largest first with desc after "
-                     'it ("betalt-forfald desc"); more fields with commas between sort ties by the next '
-                     '("betalt-forfald desc, parti"); records without the field come last.'},
-            "fields": {"type": "array", "items": {"type": "string"}, "description": "For find with document: show "
-                       "only these fields of each record (JSON keys, the words before the colon in a text record, the "
-                       "columns of a CSV or TSV table, or the words a number stands just before or after in a "
-                       'sentence: rejected units in "21 rejected units"), one record per line, to go through many '
-                       "records at once. "
-                       "A field written as two names with a minus between them (paid-due) shows the days from one "
-                       "date to the other, or one number less the other."},
+            "sort": {"type": "string", "description": "For find with document: the field to sort the records of all "
+                     "the documents named by, as one list: smallest first, or largest first with desc after it "
+                     '("betalt-forfald desc"); more fields with commas between sort ties ("betalt-forfald desc, '
+                     'parti"); records without the field come last.'},
+            "fields": {"type": "array", "items": {"type": "string"}, "description": "For find with document: only "
+                       "these fields of each record, one record per line, to go through many at once: JSON keys, the "
+                       "words before a colon in a text record, a CSV or TSV table's columns, or the words a number "
+                       'stands next to in a sentence (rejected units in "21 rejected units"). Two names with a minus '
+                       "between (paid-due) give the days from one date to the other, or one number less the other."},
             "sum": {"type": "array", "items": {"type": "string"}, "description": "For find with document: fields to "
                     "add up over every record found, on every page (amounts, lengths, quantities, or days between two "
-                    "dates written as in fields): exact totals, instead of adding the numbers yourself. When only "
-                    "counts or totals are needed, set summary: true to receive the complete calculation and source "
-                    "coverage without individual records."},
-            "summary": {"type": "boolean", "description": "For find with document: use true for questions asking "
-                        "only how many records or a total. Reads all selected documents and returns the matching "
-                        "record count, requested sums, numeric omissions and source citations, without individual "
-                        "records. The result covers all matches, so no record pagination or per-file re-summing is "
-                        "needed. With group, the group list is still paginated. Completeness applies only to the "
-                        "selected documents and query; missing or nonnumeric values remain explicit."},
+                    "dates written as in fields): exact totals, instead of adding the numbers yourself. For a count or "
+                    "a total alone, set summary: true."},
+            "summary": {"type": "boolean", "description": "For find with document: true when only a count or a total "
+                        "is asked. Reads every selected document and gives the count, the sums asked for, the values "
+                        "left out and the sources, without the records: every match is covered, so there are no pages "
+                        "to read and nothing to add up again per document. With group, the groups still come page by "
+                        "page. Complete only for the documents and words given; missing or non-numeric values are "
+                        "said."},
             "group": {"type": "string", "description": "For find with document: instead of the records, one line for "
                       "each value of this field (a customer, a route, a status), with how many records have it and "
                       "the sums asked for, largest sum first, or most records first without sum (sort: \"count\", or "
@@ -246,8 +293,7 @@ MEMORY = {
         "rest by themselves to make room and nothing is deleted. Only a full library or a memory-full message asks "
         "for action: then offer concrete options (tidy up in Knowledge; for a memory-full message also continue "
         "without saving, which makes no room for knowledge; more memory only when they ask). Starting a new "
-        "conversation or compacting does not free memory. Answer in one short "
-        f"sentence. {SPEAK}"),
+        "conversation or compacting does not free memory. Answer in one short sentence."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -274,10 +320,9 @@ CREATE = {
         "collection its own operation_id and keep it. To fix a mistake in a collection you just saved (wrong or "
         "missing text, a typo in the name), call create again with the same operation_id and the corrected content: "
         "the same collection is corrected, no second one is made. undo takes back a collection you saved in this "
-        "conversation in the last 15 minutes, when the person asks; nothing else can be removed. use_here (default "
-        "true) uses it in this conversation as soon as it is ready. Confirm in one short sentence, e.g. Saved as "
-        "knowledge: \"The book\" — it is used in this conversation. When creating is refused, pass on the reason as "
-        f"given; never send the person to the console unless the reason says so. {SPEAK}"),
+        "conversation in the last 15 minutes, when the person asks; nothing else can be removed. Confirm in one short "
+        "sentence, e.g. Saved as knowledge: \"The book\" — it is used in this conversation. When creating is "
+        "refused, pass on the reason as given; never send the person to the console unless the reason says so."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -378,6 +423,7 @@ class Written:
         with self._lock:
             _keep(self._start, session_id, kept, WRITTEN_SESSIONS)
             _keep(self._turns, session_id, kept, WRITTEN_SESSIONS)
+        FAILURES.turn(session_id)
 
     def answered(self, session_id: str, turns: list) -> None:
         """During a turn: the person's answers since it started, to questions the agent asked through clarify."""
@@ -414,6 +460,144 @@ class Written:
             if at >= 0 and not NEGATED.search(text[max(0, at - 48):at]):
                 return True
         return False
+
+
+# What a tool does when AdaptiqAI can't answer it (core's tool-failures.ts). A model request is retried by Hermes; a
+# tool's failure goes to the model, and told "try again", an agent called again and again, each step sending the whole
+# conversation. So passing trouble is asked again inside the call (knowledge.calling), and trouble that lasts says what
+# failed, that this is no answer about the knowledge, and to tell the person rather than call again in this turn. After
+# the same action failed so twice in one of the person's turns, the tool says so without asking AdaptiqAI. A refusal
+# keeps its own words and never counts.
+STOP = "Do not call it again in this turn: "
+AFTER = {
+    "adaptiq_knowledge": "tell the person their knowledge could not be read right now, and that they can ask again shortly.",
+    "adaptiq_memory": "tell the person their AdaptiqAI memory could not be read right now, and that they can ask again "
+                      "shortly.",
+    "adaptiq_create_knowledge": "tell the person it could not be saved right now, and that they can ask again shortly.",
+}
+FAILED_TWICE = "This failed twice already in this turn, so AdaptiqAI was not asked again."
+NOTHING_MISSING = "This does not mean anything is missing."
+FAILURES_PER_TURN = 2
+# Without a known turn (a subagent's, or one this process never saw start), failures count as one turn this long
+# after the last; whatever the turn, AdaptiqAI is asked again this long after the last failure.
+UNKNOWN_TURN = 2 * 60
+FAILURES_KEPT = 10 * 60
+FAILURE_SESSIONS = 64
+
+
+def stop_words(tool: str) -> str:
+    """The end of a tool's failure: not to call again in this turn, and what to tell the person (core's stopWords)."""
+    return STOP + AFTER.get(tool, AFTER["adaptiq_knowledge"])
+
+
+class _OutOfReach(knowledge.KnowledgeError):
+    """What a tool could not read, said for the agent; the guard adds what the agent does (core's ToolOutOfReach)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, passing=True)
+
+
+def _passing(error: knowledge.KnowledgeError) -> bool:
+    """Passing trouble at AdaptiqAI rather than an answer; a full memory (507) is an answer."""
+    return isinstance(error, _OutOfReach) or (error.passing and error.status != 507)
+
+
+def trouble_words(error: knowledge.KnowledgeError) -> str:
+    """What failed, for passing trouble that lasted through the call's tries (core's troubleWords)."""
+    offline = any(code in error.answer for code in knowledge.OFFLINE_CODES)
+    if error.status is None:
+        return "AdaptiqAI cannot be reached right now."
+    if knowledge.getting_ready(error.status, error.answer):
+        return "AdaptiqAI is still getting this conversation ready."
+    if offline:
+        return "The model this conversation runs on is offline right now."
+    if error.status == 429:
+        return "AdaptiqAI is busy right now."
+    if error.status == 408:
+        return "AdaptiqAI took too long to answer."
+    return "AdaptiqAI did not answer just now."
+
+
+class Failures:
+    """Each tool call's tries, and each conversation's failed actions in the person's current turn (core's
+    ToolFailures). Hermes says when a turn starts (pre_llm_call, through Written.note); a conversation it never did for
+    counts by time alone."""
+
+    def __init__(self, clock=time.monotonic, sleep=time.sleep) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._turns: OrderedDict[str, int] = OrderedDict()
+        self._failed: OrderedDict[str, dict] = OrderedDict()
+        self._started = 0
+        self._lock = threading.Lock()
+
+    def turn(self, session_id: str) -> None:
+        """A turn of the person's starts in a conversation."""
+        with self._lock:
+            self._started += 1
+            _keep(self._turns, session_id, self._started, FAILURE_SESSIONS)
+
+    def _current(self, session_id: str, now: float) -> dict | None:
+        record = self._failed.get(session_id)
+        if record is None:
+            return None
+        turn, age = self._turns.get(session_id), now - record["at"]
+        known = record["turn"] is not None and turn is not None
+        if age <= FAILURES_KEPT and (record["turn"] == turn if known else age <= UNKNOWN_TURN):
+            return record
+        self._failed.pop(session_id, None)
+        return None
+
+    def run(self, session_id: str, tool: str, action: str, work):
+        """One tool call: answered here when this action failed twice in this turn; else the call, with passing
+        trouble asked again inside it, and trouble that lasted said for the agent and counted."""
+        key = f"{tool} {action}"
+        with self._lock:
+            record = self._current(session_id, self._clock()) if session_id else None
+            stopped = record is not None and record["counts"].get(key, 0) >= FAILURES_PER_TURN
+        if stopped:
+            raise _OutOfReach(f"{FAILED_TWICE} {stop_words(tool)}")
+        try:
+            with knowledge.calling(self._clock, self._sleep):
+                result = work()
+        except knowledge.KnowledgeError as error:
+            if not _passing(error):
+                raise
+            if session_id:
+                with self._lock:
+                    now = self._clock()
+                    record = self._current(session_id, now) or {"turn": self._turns.get(session_id), "counts": {}}
+                    record["at"] = now
+                    record["counts"][key] = record["counts"].get(key, 0) + 1
+                    _keep(self._failed, session_id, record, FAILURE_SESSIONS)
+            said = str(error) if isinstance(error, _OutOfReach) else f"{trouble_words(error)} {NOTHING_MISSING}"
+            raise _OutOfReach(f"{said} {stop_words(tool)}") from error
+        if session_id:
+            with self._lock:
+                record = self._failed.get(session_id)
+                if record is not None:
+                    record["counts"].pop(key, None)
+        return result
+
+
+FAILURES = Failures()
+# The call a guarded handler is running in this thread: its conversation, tool and action, for `_run`.
+_calling = threading.local()
+
+
+def _guarded(name: str):
+    """A tool handler whose calls `_run` guards by their action."""
+    def wrap(tool):
+        def handler(args: dict, *rest, **named) -> str:
+            outer = getattr(_calling, "call", None)
+            action = args.get("action") if isinstance(args, dict) else None
+            _calling.call = (str(named.get("session_id", rest[0] if rest else "") or ""), name, str(action))
+            try:
+                return tool(args, *rest, **named)
+            finally:
+                _calling.call = outer
+        return handler
+    return wrap
 
 
 def _cwd(task_id: str) -> str:
@@ -574,14 +758,17 @@ def document_lines(start: dict, source: dict, original: str | None) -> dict:
     if original is not None and source.get("bytes") is not None and source.get("compile_bytes") is not None:
         at = text.find(original[:200])
         heading = text[:max(0, at)]
+        # A repository's file stands in a fenced block under its heading, which the engine closes after it.
+        fence = FENCE_OPENED.search(heading)
+        close = "" if fence is None else "\n" + fence.group(1)
         # The engine's text drops the line breaks the original ends with: one, or more after an empty last line,
         # or \r\n. Its size then lies between the two.
         kept = original.rstrip("\r\n")
-        engine_size = source["compile_bytes"] - len(heading.encode("utf-8"))
+        engine_size = source["compile_bytes"] - len(heading.encode("utf-8")) - len(close.encode("utf-8"))
         # The start may end inside a character, so its last one is left out.
         if (at >= 0 and original.startswith(text[at:-1])
                 and len(kept.encode("utf-8")) <= engine_size <= source["bytes"] + 1):
-            return {"lines": lines_in(heading + kept), "whole": True}
+            return {"lines": lines_in(heading + kept + close), "whole": True}
     # A start that is not all of the text may end inside a line.
     return {"lines": text.split("\n")[:-1], "whole": False}
 
@@ -591,11 +778,29 @@ def columns_line(table: dict) -> str:
     return f"Columns (line {table['line']}): {'; '.join(table['cells'])}"
 
 
+def _wide(text: str) -> bytes | None:
+    """A text as UTF-16, the units the core counts its characters in, where that differs from Python's: None for a
+    text with no character outside the basic plane."""
+    return None if text.isascii() or not ASTRAL.search(text) else text.encode("utf-16-le", "surrogatepass")
+
+
+def _units(text: str) -> int:
+    """A text's length as the core counts it: a character outside the basic plane is two."""
+    wide = _wide(text)
+    return len(text) if wide is None else len(wide) // 2
+
+
+def _high(text: str, wide: bytes | None, at: int) -> bool:
+    """Whether the core's character `at` of a text is the first half of one outside the basic plane."""
+    unit = ord(text[at]) if wide is None else int.from_bytes(wide[2 * at:2 * at + 2], "little")
+    return 0xD800 <= unit <= 0xDBFF
+
+
 def cells_of(row: str, delimiter: str) -> list[str]:
     """A row of a table cut into its cells at the delimiter, a quoted cell as CSV writes it (a delimiter inside, a
-    quote doubled) (core's cellsOf). The cells are trimmed."""
+    quote doubled) (core's cellsOf). The cells are trimmed, as the core's trim() trims them."""
     if delimiter == "|":
-        row = row.strip()
+        row = row.strip(_JS_TRIMMED)
         row = row[1:] if row.startswith("|") else row
         row = row[:-1] if row.endswith("|") else row
     cells, cell, quoted, at = [], "", False, 0
@@ -609,7 +814,7 @@ def cells_of(row: str, delimiter: str) -> list[str]:
                 at += 1
             else:
                 quoted = False
-        elif char == '"' and cell.strip() == "":
+        elif char == '"' and cell.strip(_JS_TRIMMED) == "":
             quoted, cell = True, ""
         elif char == delimiter:
             cells.append(cell)
@@ -618,7 +823,7 @@ def cells_of(row: str, delimiter: str) -> list[str]:
             cell += char
         at += 1
     cells.append(cell)
-    return [value.strip() for value in cells]
+    return [value.strip(_JS_TRIMMED) for value in cells]
 
 
 def _delimiter_of(header: str) -> str:
@@ -646,7 +851,7 @@ def table_lines(start: dict, original: str | None, engine_lines: int | None) -> 
 
     def bare(line: str) -> str:
         # A row without what the engine changes: where it cuts, and the quotes it takes off.
-        return re.sub(r'[\s|,;"]', "", line)
+        return re.sub(rf'[{_JS_SPACE}|,;"]', "", line)
 
     at = next((index for index, line in enumerate(shown) if bare(line) and bare(line) == bare(rows[0])), -1)
     if at < 0 or (len(shown) if start["whole"] else engine_lines) != at + len(rows):
@@ -655,9 +860,19 @@ def table_lines(start: dict, original: str | None, engine_lines: int | None) -> 
     complete = min(len(rows), (len(shown) if start["whole"] else len(shown) - 1) - at)
     if any(bare(shown[at + row]) != bare(rows[row]) for row in range(1, complete)):
         return engine
-    delimiter = _delimiter_of(rows[0])
+    # Excel writes "sep=;" above the header row to name the delimiter: the columns are on the next line.
+    sep = SEP.match(rows[0].strip(_JS_TRIMMED))
+    head = 1 if sep and len(rows) > 1 else 0
+    delimiter = sep.group(1) if sep else _delimiter_of(rows[head])
     return {"lines": shown[:at] + rows, "whole": True,
-            "table": {"line": at + 1, "cells": cells_of(rows[0], delimiter), "delimiter": delimiter}}
+            "table": {"line": at + 1 + head, "cells": cells_of(rows[head], delimiter), "delimiter": delimiter}}
+
+
+def table_rows_of(read: dict) -> dict[int, dict]:
+    """A document's Markdown tables, by its lines, found once."""
+    if "rows" not in read:
+        read["rows"] = markdown_rows(read["lines"])
+    return read["rows"]
 
 
 def _table_number(value: str, delimiter: str) -> float | None:
@@ -680,8 +895,8 @@ def _table_number(value: str, delimiter: str) -> float | None:
     return float(plain) if re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", plain) else None
 
 
-_MARKDOWN_ROW = re.compile(r"\s*\|.*\|\s*")
-_MARKDOWN_RULE = re.compile(r"\s*\|(?:\s*:?-+:?\s*\|)+\s*")
+_MARKDOWN_ROW = re.compile(rf"[{_JS_SPACE}]*\|{DOT}*\|[{_JS_SPACE}]*")
+_MARKDOWN_RULE = re.compile(rf"[{_JS_SPACE}]*\|(?:[{_JS_SPACE}]*:?-+:?[{_JS_SPACE}]*\|)+[{_JS_SPACE}]*")
 
 
 def markdown_rows(lines: list[str]) -> dict[int, dict]:
@@ -818,10 +1033,6 @@ def fields_of_json(found: dict):
         return None if result is None else (result, "number")
 
     return value
-
-
-# What JavaScript's \s takes for a space, as core's expressions split and match by it.
-_JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
 
 class _Folds(dict):
@@ -1403,6 +1614,313 @@ def holding_all(lines: list[str], words: list[str], is_json: bool) -> list[int]:
     return found
 
 
+def _object_row(row: str) -> bool:
+    """Whether a line is a JSON object, as a line of JSON Lines is: read as JavaScript's JSON.parse reads it."""
+    try:
+        return isinstance(json_records._parse(row), dict)
+    except (ValueError, RecursionError):
+        return False
+
+
+def json_units(lines: list[str], path: str) -> list[dict] | None:
+    """The objects of a JSON or JSON Lines document, each {first, last, depth, above, list}: its lines, how deep it
+    stands, the containers it stands in (outermost first, the document's outermost left out: a key's, or a record's,
+    each {line, key, record}), and its place in the list that holds it ({index, count, line, key}, or None). Read by a
+    scan of its brackets outside its strings, once its text is known to be valid JSON: in anything else (JSON with
+    comments) a bracket in a comment would move them. The engine's heading, and a repository's fence around the
+    file, are left out. None when it is no valid JSON (core's jsonUnits)."""
+    heading = next((index for index, row in enumerate(lines[:8]) if row.startswith("Source type: ")), -1)
+    begin = heading + 1
+    while begin < len(lines) and (lines[begin].strip(_JS_TRIMMED) == ""
+                                  or (heading >= 0 and begin < heading + 5 and SOURCE_LINE.match(lines[begin]))):
+        begin += 1
+    end = len(lines) - 1
+    if (lines[begin] if begin < len(lines) else "").startswith("```") and end > begin and CLOSER.match(lines[end]):
+        begin += 1
+        end -= 1
+    body = [row[:-1] if row.endswith("\r") else row for row in lines[begin:end + 1]]
+    text = "\n".join(body).removeprefix("\U0000feff")
+    # JSON Lines, or an export of it named .json: every line its own record.
+    jsonl = bool(JSON_LINES.search(path))
+    if not jsonl:
+        try:
+            json_records._parse(text)
+        except (ValueError, RecursionError):
+            rows = [row for row in body if row.strip(_JS_TRIMMED) != ""]
+            if len(rows) < 2 or not all(map(_object_row, rows)):
+                return None
+            jsonl = True
+    if jsonl:
+        rows = [begin + index + 1 for index, row in enumerate(body) if row.strip(_JS_TRIMMED) != ""]
+        if not all(_object_row(body[line - begin - 1]) for line in rows):
+            return None
+        return [{"first": line, "last": line, "depth": 1, "above": [],
+                 "list": {"index": index + 1, "count": len(rows), "line": rows[0], "key": ""}}
+                for index, line in enumerate(rows)]
+    units: list[dict] = []
+    stack: list[dict] = []
+    line = begin + 1
+    last_string = ""
+    key = ""
+    for token in JSON_TOKEN.finditer(text, 1 if text.startswith("\U0000feff") else 0):
+        char = token.group()
+        if char == "\n":
+            line += 1
+        elif char[0] == '"':
+            last_string = char[1:-1]
+        elif char == ":":
+            key = last_string
+        elif char in "{[":
+            parent = stack[-1] if stack else None
+            stack.append({"char": char, "line": line, "key": key if parent and parent["char"] == "{" else "",
+                          "record": char == "{" and parent is not None and parent["char"] == "[", "members": []})
+            key = ""
+        elif char in "}]":
+            if not stack:
+                return None
+            opened = stack.pop()
+            if char == "}":
+                if stack and stack[-1]["char"] == "[":
+                    stack[-1]["members"].append(len(units))
+                units.append({"first": opened["line"], "last": line, "depth": len(stack),
+                              "above": [{"line": held["line"], "key": held["key"], "record": held["record"]}
+                                        for held in stack[1:] if held["key"] != "" or held["record"]],
+                              "list": None})
+            else:
+                for index, member in enumerate(opened["members"]):
+                    units[member] = {**units[member], "list": {"index": index + 1, "count": len(opened["members"]),
+                                                               "line": opened["line"], "key": opened["key"]}}
+            key = ""
+        else:
+            key = ""
+    return units if not stack else None
+
+
+_BRACKETS_ONLY = re.compile(rf"[{_JS_SPACE}{{}}\[\],]*")
+
+
+def record_at(units: list[dict], line: int, lines: list[str]) -> dict | None:
+    """The record a line of JSON stands in: the innermost object that is an element of a list (an order in a
+    customer's list of orders), else the innermost object short of the document's own outermost one. Of objects on
+    the same lines, the outermost: a record on one line holds its own lists. A record shares no line with another:
+    where two stand on one line ('{"a": 1}, {"a": 2},'), the object that holds them both is the record, and where
+    none does, there is none. A line of brackets alone ('}, {') is no such line (core's recordAt)."""
+    holding = [unit for unit in units if unit["first"] <= line <= unit["last"] and unit["depth"] >= 1]
+    listed = [unit for unit in holding if unit["list"] is not None]
+
+    def nested(inner: dict, outer: dict) -> bool:
+        return outer["first"] <= inner["first"] and inner["last"] <= outer["last"] and outer["depth"] < inner["depth"]
+
+    def brackets(number: int) -> bool:
+        return _BRACKETS_ONLY.fullmatch(lines[number - 1] if 0 < number <= len(lines) else "") is not None
+
+    def shared(unit: dict, other: dict) -> bool:
+        return any(not brackets(number)
+                   for number in range(max(unit["first"], other["first"]), min(unit["last"], other["last"]) + 1))
+
+    def alone(unit: dict) -> bool:
+        return not any(other is not unit and other["first"] <= unit["last"] and unit["first"] <= other["last"]
+                       and not nested(other, unit) and not nested(unit, other) and shared(unit, other) for other in units)
+
+    return next(filter(alone, sorted(listed or holding, key=lambda unit: (unit["last"] - unit["first"], unit["depth"]))),
+                None)
+
+
+def headings_of(lines: list[str], start: int = 2, to: int | None = None, setext: bool = False) -> list[dict]:
+    """The Markdown headings of a text ("## Title"), in line order, each {line, level, title}, from line `start` to
+    `to` (a repository's file starts under the engine's heading). A line of a fenced block is no heading, and
+    neither is the document's first line: the engine heads every document with its name there. With `setext`, a
+    paragraph underlined with "===" or "---" is a heading too: in a Markdown file it is, in what the gateway writes
+    it never is, and a line of dashes there is a rule (core's headingsOf)."""
+    to = len(lines) if to is None else to
+
+    def text(line: int) -> str:
+        row = lines[line - 1]
+        return row[:-1] if row.endswith("\r") else row
+
+    headings: list[dict] = []
+    # A fence is closed by its own character, at least as many of them, and nothing after: a ```` block holds ```
+    # lines.
+    fence = None
+    # Front matter ("---" first, then YAML, then "---" or "..."), whose closing line would underline its last key as
+    # a heading. A rule ("---") over a text is no front matter: its next line is no key.
+    while start <= to and text(start).strip(_JS_TRIMMED) == "":
+        start += 1
+    if setext and start < to and text(start).strip(_JS_TRIMMED) == "---" and YAML_KEY.match(text(start + 1)):
+        end = start + 1
+        while end <= to and not FRONT_END.match(text(end)) and YAML_LINE.match(text(end)):
+            end += 1
+        if end <= to and FRONT_END.match(text(end)):
+            start = end + 1
+    paragraph = None
+    block = False
+    for line in range(start, to + 1):
+        row = text(line)
+        mark = FENCE.match(row)
+        if mark and (fence is None or (mark.group(1)[0] == fence[0] and len(mark.group(1)) >= fence[1]
+                                       and mark.group(2).strip(_JS_TRIMMED) == "")):
+            fence = (mark.group(1)[0], len(mark.group(1))) if fence is None else None
+            paragraph = None
+            continue
+        if fence is not None:
+            continue
+        found = ATX.match(row)
+        if found:
+            headings.append({"line": line, "level": len(found.group(1)), "title": found.group(2)})
+            paragraph = None
+            block = False
+            continue
+        under = SETEXT.match(row) if setext and paragraph is not None else None
+        if under and paragraph is not None:
+            title = " ".join(text(at).strip(_JS_TRIMMED) for at in range(paragraph, line))
+            headings.append({"line": paragraph, "level": 1 if under.group(1)[0] == "=" else 2, "title": title})
+            paragraph = None
+            continue
+        if row.strip(_JS_TRIMMED) == "":
+            paragraph = None
+            block = False
+        elif BLOCK.match(row):
+            paragraph = None
+            block = True
+        elif paragraph is None and not block and not INDENTED.match(row):
+            paragraph = line
+    return headings
+
+
+def headings_in(path: str, kind: str, lines: list[str]) -> list[dict]:
+    """A document's headings, where its text is Markdown: a Markdown file, one the gateway made Markdown of, and a
+    text whose name says no kind (no ending, or .txt) whose every "#" line stands apart as Markdown writes a
+    heading, a blank line under it. A Containerfile's, a Makefile's or a log's "# comment" has its line of code
+    there, and was read as a heading. Code, tables and other endings have none. A repository's file stands in a
+    fenced block under the engine's heading, so its headings are those inside it (core's headingsIn)."""
+    # A rotated log (app.log.1) is a log: the numbers after its ending are no ending.
+    name = ROTATED.sub("", path.split("/")[-1], count=1)
+    suffix = ENDING.search(name)
+    ending = suffix.group(1) if suffix else ""
+    if kind == "repository_file":
+        opener = next((index for index, row in enumerate(lines[:12]) if row.startswith("```")), -1)
+        if opener < 0 or not CLOSER.match(lines[-1] if lines else "") or not MARKDOWN_ENDINGS.match(ending):
+            return []
+        return headings_of(lines, opener + 2, len(lines) - 1, True)
+    if kind == "code" or kind in TABLE_TYPES:
+        return []
+    # The document's own text starts under the engine's heading ("# name", "", "Source type: …", "").
+    body = next((index for index, row in enumerate(lines[:8]) if row.startswith("Source type: ")), -1) + 3
+    if MARKDOWN_ENDINGS.match(ending):
+        return headings_of(lines, max(2, body), len(lines), True)
+    if WRITTEN_AS_MARKDOWN.match(ending):
+        return headings_of(lines)
+    if ending != "" and ending.lower() != "txt":
+        return []
+    # A build file, a dotfile and a script say their kind by their name or their first line, and are no Markdown.
+    first = lines[max(0, body - 1)] if max(0, body - 1) < len(lines) else ""
+    if NOT_MARKDOWN_NAMES.match(name) or name.startswith(".") or first.startswith("#!"):
+        return []
+    found = headings_of(lines)
+    return found if all((lines[heading["line"]] if heading["line"] < len(lines) else "").strip(_JS_TRIMMED) == ""
+                        for heading in found) else []
+
+
+def cut_text(text: str, most: int) -> str:
+    """A text cut to `most` characters with "…", never between the two halves of a character outside the basic
+    plane, counted as the core counts them (core's cutText)."""
+    wide = _wide(text)
+    if (len(text) if wide is None else len(wide) // 2) <= most:
+        return text
+    end = most - 1 if _high(text, wide, most - 1) else most
+    return (text[:end] if wide is None else wide[:2 * end].decode("utf-16-le", "surrogatepass")) + "…"
+
+
+def title_of(heading: dict) -> str:
+    """A heading's words as open names them."""
+    return cut_text(heading["title"], HEADING_CHARS)
+
+
+def headings_above(headings: list[dict], line: int) -> list[dict]:
+    """The headings a line stands under, outermost first: the chapter, the agreement and the clause a paragraph is
+    in. A heading stands under the ones above its own level (core's headingsAbove)."""
+    above: list[dict] = []
+    for heading in headings:
+        if heading["line"] > line:
+            break
+        while above and above[-1]["level"] >= heading["level"]:
+            above.pop()
+        if heading["line"] < line:
+            above.append(heading)
+    return above
+
+
+def section_at(read: dict, line: int) -> dict | None:
+    """The section a line stands in, {first, last, at, leaf, own}: from the heading above it to the next heading of
+    that level or higher; `leaf` when it has no sections of its own, `own` the last of its own lines (the one above
+    its first section, or its last). None when the document has no heading above the line, or is known by its start
+    only and the heading that ends the section is not (core's sectionAt)."""
+    headings = read.get("headings") or []
+    at = -1
+    while at + 1 < len(headings) and headings[at + 1]["line"] <= line:
+        at += 1
+    if at < 0:
+        return None
+    heading = headings[at]
+    after = next((entry for entry in headings[at + 1:] if entry["level"] <= heading["level"]), None)
+    if after is None and not read["whole"]:
+        return None
+    last = len(read["lines"]) if after is None else after["line"] - 1
+    leaf = at + 1 >= len(headings) or headings[at + 1]["level"] <= heading["level"]
+    return {"first": heading["line"], "last": last, "at": at, "leaf": leaf,
+            "own": last if leaf else headings[at + 1]["line"] - 1}
+
+
+def names_of(named: list[dict]) -> str:
+    """Headings by their words and line, as open names sections."""
+    return "; ".join(f"{title_of(heading)} (line {heading['line']})" for heading in named)
+
+
+def beside_line(headings: list[dict], at: int) -> list[str]:
+    """The line that names the sections beside one: the other clauses of its agreement, the other parts of its
+    chapter. Shown a clause alone, a reader does not see the addendum that changes it, eight headings further
+    down. Among more than open names, only the one before it and the one after it, and how many there are: in a
+    report of 500 small sections, 24 names were more than the section they stood beside. None when the section
+    stands alone (core's besideLine)."""
+    heading = headings[at]
+    before: list[dict] = []
+    after: list[dict] = []
+    up = at - 1
+    while up >= 0 and headings[up]["level"] >= heading["level"]:
+        if headings[up]["level"] == heading["level"]:
+            before.insert(0, headings[up])
+        up -= 1
+    down = at + 1
+    while down < len(headings) and headings[down]["level"] >= heading["level"]:
+        if headings[down]["level"] == heading["level"]:
+            after.append(headings[down])
+        down += 1
+    count = len(before) + len(after)
+    if count == 0:
+        return []
+    named = before[-1:] + after[:1] if count > BESIDE_SHOWN else before + after
+    where = f"under line {headings[up]['line']}" if up >= 0 else "in this document"
+    nearest = f" (the nearest {len(named)} of {count})" if len(named) < count else ""
+    return [f"Beside it {where}{nearest}: {names_of(named)}."]
+
+
+def sections_line(headings: list[dict], at: int) -> list[str]:
+    """The line that names a section's own sections, for one too long to show whole: a binder's agreements, a
+    chapter's clauses. Each is opened at its line. Its own are the headings right under it, whatever their levels
+    (core's sectionsLine)."""
+    own: list[dict] = []
+    level = math.inf
+    down = at + 1
+    while down < len(headings) and headings[down]["level"] > headings[at]["level"]:
+        if headings[down]["level"] <= level:
+            level = headings[down]["level"]
+            own.append(headings[down])
+        down += 1
+    named = own[:BESIDE_SHOWN]
+    first = f" (the first {len(named)} of {len(own)})" if len(named) < len(own) else ""
+    return [f"Its sections{first}: {names_of(named)}."]
+
+
 def reading_note(item: dict) -> str:
     """How a ready collection is read, for a status line: its size, and whether a reply reads it whole or in
     parts; nothing when its size is unknown (core's readingNote)."""
@@ -1451,9 +1969,11 @@ def _fail(message: str):
 
 
 def _run(work) -> str:
-    """A tool's answer: its sentences, or Hermes' tool error with the refusal's sentence."""
+    """A tool's answer: its sentences, or Hermes' tool error with the refusal's sentence. Passing trouble is said for
+    the agent, and counted by the action of the guarded handler it runs in."""
+    session, tool, action = getattr(_calling, "call", None) or ("", "", "")
     try:
-        return work()
+        return FAILURES.run(session, tool, action, work)
     except knowledge.KnowledgeError as error:
         return json.dumps({"error": str(error)}, ensure_ascii=False)
 
@@ -1471,12 +1991,13 @@ def _session(session_id: str) -> str:
 
 def _unreadable(item: dict, refused: str, error: knowledge.KnowledgeError,
                 instead: str = "") -> knowledge.KnowledgeError:
-    """A failed read of a collection's text never reads as "not there" (core's reading.ts). Passing trouble is
-    worth another try; a refusal is not, so it says what AdaptiqAI answered. Told to try again, an agent called
-    contents and open nine times against a 403 for the file list, and the cause never reached the person."""
-    if error.passing or error.status is None:
-        return knowledge.KnowledgeError(f"The text of {_quoted(item['name'])} could not be read just now; this does "
-                                        "not mean anything is missing. Try again in a moment.")
+    """A failed read of a collection's text never reads as "not there" (core's reading.ts). Passing trouble was
+    asked again inside the call already, so the guard says not to call again in this turn; a refusal says what
+    AdaptiqAI answered. Told to try again, an agent called contents and open nine times against a 403 for the file
+    list, and the cause never reached the person."""
+    if _passing(error) or error.status is None:
+        return _OutOfReach(f"The text of {_quoted(item['name'])} could not be read just now; this does not mean "
+                           "anything is missing.")
     answer = f" ({error.answer})" if error.answer else ""
     return knowledge.KnowledgeError(
         f"AdaptiqAI refused {refused} {_quoted(item['name'])}{answer}, and another try gets the same answer. This "
@@ -1495,8 +2016,9 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
     none is at hand, and raises when they could not be read."""
     # Where the next page of a search, an inventory or a document listing starts, by conversation.
     pages: OrderedDict[str, object] = OrderedDict()
-    # The lines of the documents opened last, by collection, its version and document.
+    # The lines of the documents opened last, by collection, its version and document, and their characters.
     known: OrderedDict[str, dict] = OrderedDict()
+    known_chars: dict[str, int] = {}
     # The documents of the last finds over many, least recently used first, with their characters.
     known_many: OrderedDict[str, tuple[dict, int]] = OrderedDict()
     many_chars = 0
@@ -1549,9 +2071,11 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         """The library, or a plain failure: an unreadable list never reads as "nothing saved"."""
         try:
             return knowledge.library(model, query, cursor, selected)
-        except knowledge.KnowledgeError:
-            return _fail("Saved knowledge could not be read just now; this does not mean there is none. Tell the "
-                         "person briefly and try again in a moment.")
+        except knowledge.KnowledgeError as error:
+            if not _passing(error):
+                raise
+            raise _OutOfReach("Saved knowledge could not be read just now; this does not mean there is none.") \
+                from error
 
     def model_here(session: str, view: dict) -> str:
         model = view.get("model") or model_of(session)
@@ -2388,8 +2912,22 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         count. Called holding the lock."""
         if many:
             keep_many(key, read, document.get("chars") or 0)
-        else:
-            _keep(known, key, read, DOCUMENTS_KEPT)
+            return
+        _keep(known, key, read, DOCUMENTS_KEPT)
+        known_chars[key] = sum(map(len, read["lines"]))
+        # What open keeps is held to KNOWN_CHARS: the oldest go first, never the one just read.
+        total = 0
+        for held in list(known_chars):
+            if held in known:
+                total += known_chars[held]
+            else:
+                del known_chars[held]
+        for held in list(known):
+            if total <= KNOWN_CHARS:
+                break
+            if held != key:
+                total -= known_chars.pop(held, 0)
+                del known[held]
 
     def lines_of(model: str, item: dict, document: dict, sources=None, many: bool = False,
                  keep: bool = True) -> dict | None:
@@ -2418,11 +2956,15 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         if ((table or (not start["whole"] and source["type"] in VERBATIM_TYPES)) and source["bytes"] is not None
                 and source["bytes"] <= ORIGINAL_BYTES):
             try:
-                original = knowledge.original(model, item["memory_id"], source["id"]).decode("utf-8")
+                # As the core's decoder reads it: a byte order mark first is no character of the text.
+                original = knowledge.original(model, item["memory_id"], source["id"]).decode("utf-8-sig")
             except (knowledge.KnowledgeError, ValueError):
                 original = None
-        read = (table_lines(start, original, document.get("lines")) if table
-                else document_lines(start, source, original))
+        if table:
+            read = table_lines(start, original, document.get("lines"))
+        else:
+            read = document_lines(start, source, original)
+            read = {**read, "headings": headings_in(document["path"], source["type"], read["lines"])}
         if read["whole"] and keep:
             with lock:
                 shelve(key, document, read, many)
@@ -2439,32 +2981,162 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         lines = read["lines"]
         # Kept by the document's version: a changed document is read again from its first line.
         key = f"{session}\nopen\n{key_of(item, document)}"
-        first = max(1, line - OPEN_BEFORE) if line is not None else page_at(key, more) or 1
-        if first > len(lines):
+        # A line is read as the section it stands in, never past it: ten lines above a clause are the end of
+        # another agreement, and the hundred after it are other clauses.
+        section = section_at(read, line) if line is not None and line <= len(lines) else None
+        # Where more reads on: a line, and a character of it.
+        start = (page_at(key, more) if line is None else None) or {"line": 1, "at": 0}
+        first = max(section["first"] if section else 1, line - OPEN_BEFORE) if line is not None else start["line"]
+        # A line past what is known is never answered with a page without it (core's show).
+        if first > len(lines) or (line is not None and line > len(lines)):
             return (f"{named} ends at line {len(lines)}." if read["whole"]
                     else f"open shows lines 1-{len(lines)} of {named}, not line {line or first}; {find_it}.")
-        shown: list[str] = []
-        size = 0
-        last = first - 1
-        while last + 1 <= len(lines) and last + 1 < first + OPEN_LINES:
-            whole = lines[last][:-1] if lines[last].endswith("\r") else lines[last]
-            text = f"{whole[:LINE_CHARS]}…" if len(whole) > LINE_CHARS else whole
-            if shown and size + len(text) > OPEN_CHARS:
-                break
-            last += 1
-            shown.append(f"{last}: {text}" if text else f"{last}:")
-            size += len(text)
-        ends = last == len(lines)
+
+        def text_of(number: int) -> str:
+            row = lines[number - 1]
+            return row[:-1] if row.endswith("\r") else row
+
+        def cost(number: int, most: int, at: int = 0) -> int:
+            """What a line takes of a page, from a character on: all of it up to `most`."""
+            return min(_units(text_of(number)) - at, most)
+
+        def page(begin_at: int, to: int, asked: int | None, at: int, slide: bool) -> dict:
+            """A page, {first, shown, last, stop, parts}: lines of up to 2,000 characters whole, as many as 16,000
+            characters and 120 lines hold, to `to` at most. The line asked for, or the first when none is, is shown
+            whole up to a page, and past that the page ends inside it (`stop`), so more reads on in it. Another line
+            longer than 2,000 characters is shown in part, and says so (`parts`). With `slide`, the page starts later
+            where the lines above the one asked for would leave it no room (core's page in show)."""
+            own = asked if asked is not None and begin_at <= asked <= to else None
+            head = begin_at
+            if slide and own is not None:
+                head = max(head, own - OPEN_LINES + 1)
+                needed = cost(own, OPEN_CHARS, at if own == head else 0)
+                for number in range(head, own):
+                    needed += cost(number, LINE_CHARS, at if number == begin_at else 0)
+                while head < own and needed > OPEN_CHARS:
+                    needed -= cost(head, LINE_CHARS, at if head == begin_at else 0)
+                    head += 1
+            shown: list[str] = []
+            size = 0
+            last = head - 1
+            stop = None
+            parts = False
+            while last + 1 <= to and last + 1 < head + OPEN_LINES:
+                number = last + 1
+                text = text_of(number)
+                wide = _wide(text)
+                length = len(text) if wide is None else len(wide) // 2
+                begin = at if number == begin_at else 0
+                whole = number == own or (own is None and number == head)
+                end = begin + min(length - begin, max(1, OPEN_CHARS - size) if whole else LINE_CHARS)
+                if shown and size + end - begin > OPEN_CHARS:
+                    break
+                # Never between the two halves of a character outside the basic plane.
+                if end < length and end > begin + 1 and _high(text, wide, end - 1):
+                    end -= 1
+                last = number
+                piece = text[begin:end] if wide is None else wide[2 * begin:2 * end].decode("utf-16-le", "surrogatepass")
+                shown.append((f"{number}: {piece}" if piece else f"{number}:") if begin == 0 and end == length
+                             else f"{number} (characters {begin + 1:,}-{end:,} of {length:,}): {piece}")
+                size += end - begin
+                if end < length:
+                    if whole:
+                        stop = end
+                        break
+                    parts = True
+            return {"first": head, "shown": shown, "last": last, "stop": stop, "parts": parts}
+
+        # The section whole when a page holds it. One too long for a page is read around the line, and never past
+        # its end. Where the line stands above the section's own sections, its own lines and their names instead:
+        # the first 120 lines of a chapter stop inside one of its clauses and name none of the rest.
+        kind = "page"
+        shown_page = page(first, len(lines), line, start["at"] if line is None else 0, True)
+        if section is not None:
+            whole_section = page(section["first"], section["last"], line, 0, False)
+            own = None if section["leaf"] else page(section["first"], section["own"], line, 0, False)
+            if whole_section["last"] == section["last"] and whole_section["stop"] is None:
+                shown_page = whole_section
+                kind = "section"
+            elif own is not None and own["last"] == section["own"] and own["stop"] is None:
+                shown_page = own
+                kind = "own"
+            else:
+                shown_page = page(first, section["last"], line, 0, True)
+        # Asked for a line of JSON or of a table, the record or the row it stands in: the lines around it are other
+        # records. A record too long for a page is read around the line, never past its end. Where it stands, and
+        # its place among the others, are said.
+        place: list[str] = []
+        if line is not None and kind == "page" and line <= len(lines):
+            in_json = json_records.is_structured_json(path) and read.get("table") is None
+            if in_json and "units" not in read:
+                read["units"] = json_units(lines, path)
+            # Named apart from the record module this file reads.
+            found_record = record_at(read["units"] or [], line, lines) if in_json else None
+            rows = None if in_json or read.get("table") is not None else table_rows_of(read)
+            header = None if in_json else read.get("table") or rows.get(line)
+            if found_record is not None:
+                unit = page(found_record["first"], found_record["last"], line, 0, False)
+                shown_page = (unit if unit["last"] == found_record["last"] and unit["stop"] is None
+                              and unit["first"] == found_record["first"]
+                              else page(max(found_record["first"], line - OPEN_BEFORE), found_record["last"], line, 0,
+                                        True))
+                if shown_page is unit:
+                    kind = "object" if found_record["list"] is None else "record"
+
+                def labelled(held: dict) -> int:
+                    # A record's "{" alone on its line says nothing: its first field does.
+                    return (held["line"] + 1 if held["key"] == "" and lines[held["line"] - 1].strip(_JS_TRIMMED) == "{"
+                            else held["line"])
+
+                # A line on the page is not said again.
+                place = [f"Under (line {labelled(held)}): "
+                         f"{cut_text(lines[labelled(held) - 1].strip(_JS_TRIMMED), HEADING_CHARS)}"
+                         for held in found_record["above"] if labelled(held) < shown_page["first"]]
+                listed = found_record["list"]
+                if listed is not None:
+                    # How many there are only where all of the document is known: of its start, a count would be
+                    # wrong.
+                    where = "in the list" if listed["key"] == "" else f'in "{listed["key"]}"'
+                    count = f" of {listed['count']:,}" if read["whole"] else ""
+                    place.append(f"Record {listed['index']:,}{count} {where} at line {listed['line']}.")
+            elif header is not None and line > header["line"]:
+                top = bottom = line
+                if rows is not None:
+                    while rows.get(top - 1) is header:
+                        top -= 1
+                    while rows.get(bottom + 1) is header:
+                        bottom += 1
+                else:
+                    top, bottom = header["line"] + 1, len(lines)
+                shown_page = page(line, line, line, 0, True)
+                kind = "row"
+                count = f" of {bottom - top + 1:,}" if read["whole"] else ""
+                place = [f"Row {line - top + 1:,}{count} of the table at line {header['line']}."]
+        first, last, stop = shown_page["first"], shown_page["last"], shown_page["stop"]
+        ends = last == len(lines) and stop is None
         # The end is kept too: another "more" says the document ends there, never shows its first page again.
-        page_next(key, last + 1)
-        after = ("More: open it again with more: true." if not ends else "That is the end of it." if read["whole"]
-                 else f"open shows no line past {last}; {find_it}.")
+        page_next(key, {"line": last + 1, "at": 0} if stop is None else {"line": last, "at": stop})
+        said = {"page": "", "section": "That is all of that section. ",
+                "own": "Those are its own lines, above its sections. ", "record": "That is the whole record. ",
+                "object": "That is the whole object. ", "row": "That is the whole row. "}[kind]
+        after = (f"Line {last} goes on past character {stop:,}: open it again with more: true for the rest of it."
+                 if stop is not None else f"{said}More: open it again with more: true." if not ends
+                 else "That is the end of it." if read["whole"] else f"open shows no line past {last}; {find_it}.")
         # A page that starts inside a table (a CSV's rows, a workbook's sheet) shows its columns, as its header row
         # is above it.
-        header = read.get("table") or (None if record.is_json_document(path) else markdown_rows(lines).get(first))
+        header = read.get("table") or (None if record.is_json_document(path) else table_rows_of(read).get(first))
         columns = ([columns_line(header)] if header is not None and (first > header["line"] or last < header["line"])
                    else [])
-        return "\n".join([f"{named}, lines {first}-{last}:", *columns, *shown,
+        # The headings the page stands under, as their lines are above it: whose clause, which chapter's part.
+        headings = read.get("headings") or []
+        under = [*(f"Under (line {heading['line']}): {title_of(heading)}" for heading in headings_above(headings, first)),
+                 *(row for row in place if row.startswith("Under "))]
+        beside = [row for row in place if not row.startswith("Under ")]
+        if section is not None and kind in ("section", "own"):
+            beside += (sections_line(headings, section["at"]) if kind == "own"
+                       else beside_line(headings, section["at"]) if section["leaf"] else [])
+        whole = ["A line shown in part is shown whole by open at its line."] if shown_page["parts"] else []
+        return "\n".join([f"{named}, lines {first}-{last}:", *under, *columns, *shown_page["shown"], *beside, *whole,
                           f"These are its exact lines: answer from them and cite {path}:line. {after}"])
 
     def open_document(session: str, model: str, view: dict, args: dict) -> str:
@@ -2474,18 +3146,27 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         line = args.get("line")
         line = (int(line) if isinstance(line, (int, float)) and not isinstance(line, bool) and math.isfinite(line)
                 and line > 0 else None)
+        # A document by its whole path, else the one path of all those used here that ends with the name, as core's
+        # open: never a shorter path the name ends with (a Rust book listing it lacks opened its top-level
+        # Cargo.toml), nor the first of many (src/main.rs ends hundreds of its paths).
+        ending: list[tuple[dict, dict]] = []
         close: list[str] = []
         for item in used_here(view, str(args.get("name") or "")):
             documents = documents_of(model, item)
-            match = next((entry for entry in documents if entry["path"] == wanted), None) or next(
-                (entry for entry in documents
-                 if entry["path"].endswith("/" + wanted) or wanted.endswith("/" + entry["path"])), None)
+            match = next((entry for entry in documents if entry["path"] == wanted), None)
             if match is not None:
                 return show(session, model, item, match, line, args.get("more") is True)
+            ending += [(item, entry) for entry in documents if entry["path"].endswith("/" + wanted)]
             close += [entry["path"] for entry in documents if wanted.lower() in entry["path"].lower()]
-        return _fail(f"No document is called {_quoted(wanted)}. Close: {', '.join(close[:8])}." if close
+        if len(ending) == 1:
+            return show(session, model, ending[0][0], ending[0][1], line, args.get("more") is True)
+        # Those that end with the name come first, to pick one from.
+        named = list(dict.fromkeys([entry["path"] for _, entry in ending] + close))
+        rest = f", and {len(named) - 8:,} more" if len(named) > 8 else ""
+        return _fail(f"No document is called {_quoted(wanted)}. Close: {', '.join(named[:8])}{rest}." if named
                      else f"No document is called {_quoted(wanted)}. Take contents, or find words it holds.")
 
+    @_guarded("adaptiq_knowledge")
     def knowledge_tool(args: dict, session_id: str = "", **_) -> str:
         def work() -> str:
             _connected()
@@ -2531,6 +3212,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
 
         return _run(work)
 
+    @_guarded("adaptiq_memory")
     def memory_tool(args: dict, session_id: str = "", **_) -> str:
         def work() -> str:
             _connected()
@@ -2757,6 +3439,7 @@ def create_handler(written: Written, model_of, follow, unfollow=lambda memory_id
         made.pop(memory_id, None)
         return entry["name"], "removed"
 
+    @_guarded("adaptiq_create_knowledge")
     def create_tool(args: dict, session_id: str = "", task_id: str = "default", **_) -> str:
         def work() -> str:
             _connected()

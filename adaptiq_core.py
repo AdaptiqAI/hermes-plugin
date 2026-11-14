@@ -14,6 +14,7 @@ apiKeys), so an old key never hides a working one.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -42,7 +43,7 @@ APP = "Hermes"
 
 def _call(method: str, path: str, body: dict | None = None, key: str | None = None,
           headers: dict | None = None, timeout: float = 15) -> tuple[int, dict]:
-    headers = {"Content-Type": "application/json", **(headers or {})}
+    headers = {"Content-Type": "application/json", **wire.CLIENT, **(headers or {})}
     if key:
         headers["Authorization"] = "Bearer " + key
     data = json.dumps(body).encode() if body is not None else None
@@ -193,7 +194,12 @@ def wait(started: dict) -> str:
     """Poll until approved; times out with the code so an unattended run never hangs."""
     deadline = time.time() + int(started.get("expires_in") or 600)
     while time.time() < deadline:
-        status, reply = poll_once(started["device_code"])
+        try:
+            status, reply = poll_once(started["device_code"])
+        except (OSError, ValueError, http.client.HTTPException):
+            # No answer (a dropped connection, a timeout, a reply cut off): the approval in the
+            # browser may still come, so wait and ask again, as the core does.
+            status, reply = 0, {}
         if status == 200:
             return reply["access_token"]
         if status == 403:
