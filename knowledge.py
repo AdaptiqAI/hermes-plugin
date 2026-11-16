@@ -357,6 +357,80 @@ def conversation_view(session_id: str, model: str | None) -> dict:
     }
 
 
+# The most events AdaptiqAI's timeline gives in one read (the engine's TIMELINE_MAX_EVENTS), and the most reads of
+# one conversation's timeline for a find: its first 2,000 events (core's TIMELINE_PAGE and TIMELINE_READS).
+TIMELINE_PAGE = 100
+TIMELINE_READS = 20
+
+
+def timeline(conversation_id: str, model: str | None) -> dict:
+    """What was said in a conversation, as AdaptiqAI's timeline of it gives it (core's conversationTimeline): its
+    events from the first on, oldest first, each one's text up to the length the timeline keeps (`truncated` when
+    cut), and how many it has in all. The timeline gives TIMELINE_PAGE events a read and the place to read on from
+    (`after`, `next_cursor`): asked for 500 at once, it gave the latest 100, and a count over a conversation of 340
+    messages searched its last few turns (2026-11-16). `left` says what the events leave out: None; "after", past
+    TIMELINE_READS reads; or "before", from an AdaptiqAI that gives a conversation's latest alone."""
+    number = lambda value: value if isinstance(value, int) and not isinstance(value, bool) else None  # noqa: E731
+    events: dict[int, dict] = {}
+    meta: dict = {}
+    left = None
+    after, reads = -1, 1
+    while True:
+        body = _call("GET", _path(conversation_id, "timeline") + f"?limit={TIMELINE_PAGE}&after={after}",
+                     model=model) or {}
+        for raw in body.get("data") or []:
+            if not isinstance(raw, dict) or number(raw.get("seq")) is None:
+                continue
+            events[raw["seq"]] = {
+                "seq": raw["seq"], "id": raw.get("event_id") if isinstance(raw.get("event_id"), str) else None,
+                "role": raw.get("role") if isinstance(raw.get("role"), str) else "",
+                "text": raw.get("text") if isinstance(raw.get("text"), str) else "",
+                "truncated": raw.get("truncated") is True,
+                "bytes": raw.get("bytes") if isinstance(raw.get("bytes"), int) else None}
+        meta = (body.get("timeline") if isinstance(body.get("timeline"), dict) else (
+            (body.get("session") or {}).get("timeline") if isinstance(body.get("session"), dict) else None)) or meta
+        if body.get("has_more") is not True:
+            break
+        following = number(body.get("next_cursor"))
+        if following is None or following <= after:
+            # More, and no place to read on from: an AdaptiqAI that gives a conversation's latest events alone.
+            left = "before" if reads == 1 else "after"
+            break
+        if reads == TIMELINE_READS:
+            left = "after"
+            break
+        after, reads = following, reads + 1
+    total = number(meta.get("event_count"))
+    if left is None and total is not None and len(events) < total:
+        # An AdaptiqAI that does not say there are more: its count of them does.
+        left = "before"
+    return {"events": [events[seq] for seq in sorted(events)], "count": total, "latest": number(meta.get("latest_seq")),
+            "left": left}
+
+
+# The most of one message AdaptiqAI gives in one read, in characters, and the most reads of one message: 16,000,000
+# characters, as large as a file AdaptiqAI takes (core's MESSAGE_PART and MESSAGE_READS).
+MESSAGE_PART = 1_000_000
+MESSAGE_READS = 16
+
+
+def message(conversation_id: str, event_id: str, model: str | None) -> str:
+    """One message of a conversation whole, which AdaptiqAI gives a part at a time (core's conversationMessage), in
+    at most MESSAGE_READS parts: a server that kept saying there was more was read without end."""
+    text, offset = "", 0
+    for _ in range(MESSAGE_READS):
+        body = _call("GET", _path(conversation_id, "timeline", event_id) + f"?offset={offset}&length={MESSAGE_PART}",
+                     model=model, timeout=60) or {}
+        part = body.get("text")
+        if not isinstance(part, str):
+            raise KnowledgeError("AdaptiqAI gave no text for this message.")
+        text += part
+        offset += len(part)
+        if body.get("has_more") is not True or not part:
+            return text
+    raise KnowledgeError("This message is longer than find reads whole.")
+
+
 def collections_of(conversation_id: str, model: str | None) -> list[str] | None:
     """The names of the collections an earlier conversation reads, or None when it can't be read now (core's
     collectionsOfConversations reads them)."""

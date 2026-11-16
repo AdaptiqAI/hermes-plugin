@@ -208,7 +208,10 @@ def json_records(lines: list[str], path: str) -> list[dict]:
             pairs = entries(value)
             own = [(name, item) for name, item in pairs if _scalar(item)]
             search = "\n".join([key, stringify(dict(own), "  "), *([raw] if len(own) == len(pairs) else [])]).lower()
-            records.append({"start": start, "end": line, "offset": offset, "value": value, "search": search})
+            # Where the object it stands in starts, and the key it stands under there, or "" for a list's item or
+            # the top (core's parent and key).
+            records.append({"start": start, "end": line, "offset": offset, "value": value, "search": search,
+                            "parent": stack[-1][0] if stack else None, "key": _parse(key) if key else ""})
         previous = mark
     records.sort(key=lambda entry: entry["offset"])
     return records

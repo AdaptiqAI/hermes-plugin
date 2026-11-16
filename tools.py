@@ -221,8 +221,51 @@ NOTHING_FOUND = ("Nothing was found, so there are no lines to answer from. Try o
 FIND_IN_CONVERSATION = (
     "find_in_conversation: every line the person wrote in this conversation that holds the words (every turn, as the "
     "harness holds them, a line a record), page by page; fields, sort, sum and group work as in find. Use it to "
-    "count, add up or list what was said or noted in this conversation: a long conversation is read in parts, and "
-    "this shows every line.")
+    "count, add up or list what was said or noted in this conversation, or, with conversation, in one added here (by "
+    'its name as status shows it) or in "all" of them and this one together, as one list: a long conversation is '
+    "read in parts, and this shows every line.")
+# find_in_conversation's conversation (core's CONVERSATION_PARAMETER), and what status says of the ones added here
+# that are ready (core's ADDED_READ): a long one is in the model's context in parts, so a detail or a count is found.
+CONVERSATION_PARAMETER = ("For find_in_conversation: a conversation added here, by its name as status shows it, to find "
+                          'in it instead of this one; or "all" for this conversation and every one added here '
+                          "together, as one list. Leave it out for this conversation.")
+ADDED_READ = ("They are read-only memory in your context, a long one in parts: answer from them directly, and to find a "
+              "detail in them, or count, add up or list what they hold, use find_in_conversation with conversation set "
+              'to one\'s name, or "all" for them and this one together.')
+# What find says first when it is given a conversation (core's CONVERSATION_NOT_FOR_FIND): sent with find, it was
+# passed over in silence, and the collections' "nothing" read as the conversations' (MiMo eval, 2026-11-15).
+CONVERSATION_NOT_FOR_FIND = ("conversation is for find_in_conversation, not find: this found in the collections alone. "
+                             "To find in the conversations added here, use find_in_conversation with conversation.")
+
+
+def unsearched_note(names: list[str]) -> list[str]:
+    """What a find in this conversation alone says of the conversations added here, by their names (core's
+    unsearchedNote): its line, or no line when none is added here."""
+    if not names:
+        return []
+    one = len(names) == 1
+    which = "the conversation" if one else f"the {len(names)} conversations"
+    listed = ", ".join(f'"{name}"' for name in names)
+    their = "its" if one else "one's"
+    return [f"Not searched: {which} added here, {listed}. To find in {'it' if one else 'them'} too, set conversation "
+            f'to "all", or to {their} name.']
+
+
+def not_searched_by_find(names: list[str]) -> list[str]:
+    """What a find in the collections that found nothing says of the conversations added here (core's
+    notSearchedByFind). Asked for a part number in a conversation added after the first turn, agents ran find 9 to 19
+    times, found nothing in the collections and said it was not there (e04, MiMo eval, 2026-11-15): status, asked
+    before the conversation was added, named none, and no find said one was there."""
+    if not names:
+        return []
+    one = len(names) == 1
+    which = "the conversation" if one else f"the {len(names)} conversations"
+    listed = ", ".join(f'"{name}"' for name in names)
+    their = "its" if one else "one's"
+    return [f"find searched the collections alone, not {which} added here: {listed}. find_in_conversation with "
+            f'conversation set to {their} name, or "all", finds in {"it" if one else "them"}.']
+
+
 # What find_in_conversation lists its lines under, what it says it read and how it ends (core's reading.ts), and what
 # it says when the conversation could not be read (core's tools.ts): never that nothing is there.
 THIS_CONVERSATION = "this conversation"
@@ -261,13 +304,15 @@ KNOWLEDGE = {
                          'several with commas between ("01_Afregning.json, 02_Afregning.json"), or the start or a '
                          "part of their names."},
             "line": {"type": "number", "description": "For open: the line to read around."},
+            "conversation": {"type": "string", "description": CONVERSATION_PARAMETER},
             "sort": {"type": "string", "description": "For find with document: the field to sort the records of all "
                      "the documents named by, as one list: smallest first, or largest first with desc after it "
                      '("betalt-forfald desc"); more fields with commas between sort ties ("betalt-forfald desc, '
                      'parti"); records without the field come last.'},
             "fields": {"type": "array", "items": {"type": "string"}, "description": "For find with document: only "
-                       "these fields of each record, one record per line, to go through many at once: JSON keys, the "
-                       "words before a colon in a text record, a CSV or TSV table's columns, or the words a number "
+                       "these fields of each record, one record per line, to go through many at once: JSON keys (one "
+                       "inside an object by its path, detaljer.pris_kr), the words before a colon in a text record, a "
+                       "CSV or TSV table's columns, or the words a number "
                        'stands next to in a sentence (rejected units in "21 rejected units"). Two names with a minus '
                        "between (paid-due) give the days from one date to the other, the minutes from one time to the "
                        "other (a date with a time of day), or one number less the other."},
@@ -1045,20 +1090,106 @@ def fields_of_record(start: int, end: int, text, table: dict | None = None):
     return value
 
 
-def fields_of_json(found: dict):
-    """A JSON object's fields by name, each as its text and its JSON kind (core's fieldsOfJson): its key in any case,
-    else the first key that holds the name; never a number from a sentence, as a JSON value says what it is. "a-b" is
-    the days from one date to the other, or one number less the other, and no difference with a null. None for a
-    field the object lacks."""
-    pairs = [(key.lower(), json_records.field(value)) for key, value in json_records.entries(found["value"])]
+def _paths_in(value: dict, keys: tuple = (), out: list | None = None) -> list[tuple[str, tuple, object]]:
+    """The keys inside a JSON object, below its own, each with the path of keys to it in lower case, the keys as
+    written, and its value (core's pathsIn); a list's items are left out, as len and sum count and add them up."""
+    out = [] if out is None else out
+    if len(keys) >= 8:
+        return out
+    for key, item in json_records.entries(value):
+        path = (*keys, key)
+        if keys:
+            out.append((".".join(path).lower(), path, item))
+        if isinstance(item, dict):
+            _paths_in(item, path, out)
+    return out
 
-    def own(field: str) -> tuple[str, str] | None:
-        wanted = field.lower()
-        pair = next((pair for pair in pairs if pair[0] == wanted), None) or next(
-            (pair for pair in pairs if wanted in pair[0]), None)
-        return None if pair is None else pair[1]
 
-    def value(field: str) -> tuple[str, str] | None:
+def json_names(value: dict) -> list[str]:
+    """The fields a JSON record names, as it writes them: its keys, and the paths to the values inside its objects
+    (core's jsonNames)."""
+    inside = [".".join(keys) for _, keys, item in _paths_in(value) if not isinstance(item, (dict, list))]
+    return [*(key for key, _ in json_records.entries(value)), *inside][:40]
+
+
+def object_reader(value: dict) -> tuple:
+    """One JSON object's values by name, worked out when first asked for (core's readerOf): `read(wanted)` gives its
+    own key in any case, else the first key that holds the name, else a key inside it by its path, else the only one
+    whose path ends so; `own(wanted)` its own key alone; `path(wanted)` a key inside it by its whole path alone. Each
+    gives the keys to the value from the object, and the value, or None. Built anew for each record that stands in
+    the object, 4,000 records under one object's keys took 44 s and 4.4 GB (2026-11-16)."""
+    keys: dict | None = None
+    inside: list | None = None
+    paths: dict | None = None
+
+    def path(wanted: str) -> tuple | None:
+        nonlocal inside, paths
+        if inside is None:
+            inside = _paths_in(value)
+        if paths is None:
+            paths = {}
+            for lowered, written, item in inside:
+                paths.setdefault(lowered, (written, item))
+        return paths.get(wanted)
+
+    def own(wanted: str) -> tuple | None:
+        nonlocal keys
+        if keys is None:
+            keys = {}
+            for key, item in json_records.entries(value):
+                keys.setdefault(key.lower(), ((key,), item))
+        return keys.get(wanted)
+
+    def read(wanted: str) -> tuple | None:
+        nonlocal inside
+        mine = own(wanted)
+        if mine is not None:
+            return mine
+        for key, held in keys.items():
+            if wanted in key:
+                return held
+        exact = path(wanted)
+        if exact is not None:
+            return exact
+        ending = [(written, item) for lowered, written, item in inside if lowered.endswith("." + wanted)]
+        return ending[0] if len(ending) == 1 else None
+
+    return read, own, path
+
+
+def fields_of_json(found: dict, whole: tuple = (), reader_of=lambda entry: object_reader(entry["value"])):
+    """A JSON object's fields by name, each as its text, its JSON kind and the place its value stands at in the
+    document (core's fieldsOfJson): its key in any case, else the first key that holds the name; a key inside an
+    object by its path ("detaljer.pris_kr"), else the only key inside it whose path ends so; else the key itself, or
+    the whole path to one inside, in the objects it is a part of (`whole`, nearest first): a sum of
+    "detaljer.reservedel.pris_kr" over entries and parts the words found left out the entries found by their part
+    alone (2026-11-16). Never a number from a sentence, as a JSON value says what
+    it is. "a-b" is the days from one date to the other, or one number less the other, and no difference with a
+    null. None for a field the object lacks. `reader_of` gives an object's reader, kept for the find."""
+    chain = (found, *whole)
+
+    def placed(held: tuple, depth: int) -> tuple[str, str, str]:
+        # A value's place: the outermost object it is a part of, and the keys to it from there, whichever record
+        # reads it.
+        keys, item = held
+        return (*json_records.field(item),
+                json.dumps([chain[-1]["offset"], *(entry["key"] for entry in reversed(chain[depth:-1])), *keys]))
+
+    def own(field: str) -> tuple[str, str, str] | None:
+        wanted = field.lower().strip()
+        mine = reader_of(found)[0](wanted)
+        if mine is not None:
+            return placed(mine, 0)
+        for index, entry in enumerate(whole):
+            held = reader_of(entry)[1](wanted)
+            if held is None and "." in wanted:
+                # A path has a point in it: no object is gone through for a plain name.
+                held = reader_of(entry)[2](wanted)
+            if held is not None:
+                return placed(held, index + 1)
+        return None
+
+    def value(field: str) -> tuple[str, str, str] | None:
         found_here = own(field)
         if found_here is not None or "-" not in field:
             return found_here
@@ -1066,9 +1197,22 @@ def fields_of_json(found: dict):
         if (left is not None and left[1] == "null") or (right is not None and right[1] == "null"):
             return None
         result = _difference(None if left is None else left[0], None if right is None else right[0])
-        return None if result is None else (result, "number")
+        return None if result is None else (result, "number", f"{left[2]}-{right[2]}")
 
     return value
+
+
+def added_once(places: list) -> list[bool]:
+    """Which of the values read for a sum are added, by the place each stands at (core's addedOnce): each value of a
+    document once, whichever records read it. The words of a find stood in a log entry, in its details and in its
+    part, three records that all read the part's price: two prices, 1,000 and 500, came to 4,500 (2026-11-16)."""
+    seen: set = set()
+    once = []
+    for place in places:
+        once.append(place is None or place not in seen)
+        if place is not None:
+            seen.add(place)
+    return once
 
 
 class _Folds(dict):
@@ -1592,15 +1736,38 @@ def _records(docs: list[dict], hits: list[list[int]], query: str) -> list[dict]:
     needle = query.lower()
     for doc, found in zip(docs, hits):
         last = None
+        by_offset = {entry["offset"]: entry for entry in doc.get("objects") or []}
+        readers: dict[int, tuple] = {}
+
+        def reader_of(entry: dict, readers: dict = readers) -> tuple:
+            """An object's reader, one for the find: a record and every part of it read the same object."""
+            if entry["offset"] not in readers:
+                readers[entry["offset"]] = object_reader(entry["value"])
+            return readers[entry["offset"]]
+
+        def whole_of(found_object: dict, by_offset: dict = by_offset) -> tuple:
+            """The objects a JSON record is a part of, nearest first (core's wholeOf): those it stands under a key
+            of, out to the first that is a list's item or stands at the top. The fields it lacks are read there, and
+            no further out: an entry of a report's list read the report's own status as its own (2026-11-16)."""
+            chain, at = [], found_object
+            while at["key"] != "" and at["parent"] in by_offset:
+                at = by_offset[at["parent"]]
+                chain.append(at)
+            return tuple(chain)
+
         for hit in found:
             if "objects" in doc:
                 found_object = doc["objects"][hit]
                 start, end = found_object["start"], found_object["end"]
                 at = next((index for index, line in enumerate(doc["lower"][start - 1:end]) if needle in line), 0)
-                typed = fields_of_json(found_object)
+                whole = whole_of(found_object)
+                typed = fields_of_json(found_object, whole, reader_of)
                 records.append({"doc": doc, "hit": start + at, "table": None, "typed": typed, "object": found_object,
+                                # The outermost object it is a part of: itself, or the entry its details and its
+                                # part stand in (core's outermost).
+                                "outermost": (id(doc), (whole[-1] if whole else found_object)["offset"]),
                                 "record": {"start": start, "end": end, "whole": True, "lines": {}},
-                                "names": [key for key, _ in json_records.entries(found_object["value"])],
+                                "names": json_names(found_object["value"]),
                                 "read": lambda field, typed=typed: (lambda value: None if value is None else value[0])(
                                     typed(field))})
                 continue
@@ -2001,8 +2168,7 @@ def conversations_note(items: list[dict]) -> str | None:
     pending = [item for item in items if item["readiness"] != "ready"]
     parts = []
     if ready:
-        parts.append(f"Earlier conversations added here: {_names(ready)}. They are read-only memory already in your "
-                     "context: answer from them directly; no tool reads them.")
+        parts.append(f"Earlier conversations added here: {_names(ready)}. {ADDED_READ}")
     if pending:
         parts.append(f"Not in your context yet: {_names(pending)}; "
                      f"{'it arrives' if len(pending) == 1 else 'they arrive'} with a later reply.")
@@ -2021,6 +2187,30 @@ def _memory_view(raw) -> dict | None:
     history_limit, history = _count(raw.get("session_limit_tokens")), _count(raw.get("session_tokens"))
     return {"available": True, "used": used, "limit": limit, "full": raw.get("full") is True or used >= limit,
             "history": {"used": history, "limit": history_limit} if history_limit and history is not None else None}
+
+
+# The longest pattern AdaptiqAI's search takes, in characters (the engine's MAX_PATTERN_CHARS; core's PATTERN_CHARS).
+PATTERN_CHARS = 200
+
+
+def _all_words(words: list[str]) -> tuple[str, list[str], list[str]]:
+    """The search for lines that hold every word, in any order and any case, the words it searches and the words it
+    leaves out (core's allWords): a lookahead for each word, from the line's start. Without the "^" the engine tries
+    the lookaheads again from every character of a line that lacks a word, 1.1 s on a line of 60,000 characters, and
+    refuses the pattern past the 2 s it gives a line (400 invalid_pattern, MiMo eval 2026-11-15); from the start
+    alone the same lines take under a millisecond (measured in the engine's collection_search, 2026-11-16). Each
+    order of the words one after another ("a.*b|b.*a") is past PATTERN_CHARS with three words of 27 letters in all.
+    A query's 120 characters fit with up to 14 words; with more, the longest words that fit are searched, in the
+    order they came. A word asked several times, in any case, is searched once."""
+    def pattern(searched: list[str]) -> str:
+        return "(?i)^" + "".join(f"(?=.*{_literal(word)})" for word in searched)
+
+    asked = [word for at, word in enumerate(words) if word.lower() not in (other.lower() for other in words[:at])]
+    searched = list(asked)
+    while len(searched) > 1 and len(pattern(searched)) > PATTERN_CHARS:
+        shortest = min(len(word) for word in searched)
+        del searched[max(index for index, word in enumerate(searched) if len(word) == shortest)]
+    return pattern(searched), searched, [word for word in asked if word not in searched]
 
 
 def _fail(message: str):
@@ -2583,7 +2773,10 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             cited: list[str] = []
             chars = 0
             for doc in docs:
-                line = f"- {doc['path']}:1-{len(doc['lines'])}: {count(doc)} matching records; read in full."
+                # A conversation read in part was not read in full: a count over the first 2,000 events of 2,300
+                # said so (core's listRecords).
+                line = (f"- {doc['path']}:1-{len(doc['lines'])}: {count(doc)} matching records"
+                        f"{', in what was read of it' if doc.get('partial') else '; read in full'}.")
                 if chars + len(line) > knowledge.RECORD_CHARS:
                     break
                 cited.append(line)
@@ -2612,6 +2805,15 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                                else None if typed is None else typed[0], None if typed is None else typed[1]))
             return values
 
+        def places_of(field: str) -> list:
+            """Where each record's value of a field stands in its document, for a JSON value (core's valueAt): an
+            entry and a part of it that the words found too read the same value."""
+            places = []
+            for entry in records:
+                typed = None if entry["typed"] is None else entry["typed"](field)
+                places.append(None if typed is None else f"{id(entry['doc'])} {typed[2]}")
+            return places
+
         # A field no record has is said, with the fields a record has: sorted by a name it does not know, find kept
         # the document's order.
         missing = [field for field in dict.fromkeys([*fields, *(entry["field"] for entry in sort), *sums,
@@ -2631,26 +2833,32 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         # A summary says how many records each sum leaves out, and why.
         numeric = []
         for field in sums:
-            values = values_of(field)
-            numbers = numbers_of(values)
+            read = values_of(field)
+            once = added_once(places_of(field))
+            values = [value for value, kept in zip(read, once) if kept]
+            numbers = [number for number, kept in zip(numbers_of(read), once) if kept]
+            # The records that read a value another of them gave already: it is in the sum once.
+            again, base = len(read) - len(values), len(values)
+            shared = ("" if not again else f"; {again} more {'record reads' if again == 1 else 'records read'} these "
+                      "same values, in an object they hold or are a part of, added once")
             found = [number for number in numbers if number is not None]
             unread = [value for (_, _, value, _), number in zip(values, numbers) if value is not None and number is None]
-            if summary and len(found) < len(records):
+            if summary and len(found) < base:
                 absent = sum(1 for _, _, value, _ in values if value is None)
                 nulls = sum(1 for _, _, _, kind in values if kind == "null")
                 numeric.append(f"Numeric coverage of {field}: {len(found)} numeric; {absent} missing; {nulls} null; "
-                               f"{len(records) - len(found) - absent - nulls} nonnumeric or unreadable. "
-                               f"{len(records) - len(found)} of {len(records)} records excluded from this sum; the full "
+                               f"{base - len(found) - absent - nulls} nonnumeric or unreadable. "
+                               f"{base - len(found)} of {base} records excluded from this sum; the full "
                                "total is unavailable.")
             if not found:
-                totals.append(f"Sum of {field}: none of the {len(records)} records has a number for it"
+                totals.append(f"Sum of {field}: none of the {base} records has a number for it"
                               f"{f' ({_quoted(unread[0])} is not one find can read)' if unread else ''}.")
                 continue
-            over = (f"all {len(records)} records" if len(found) == len(records)
-                    else f"the {len(found)} of {len(records)} records that have a number for it")
+            over = (f"all {base} records" if len(found) == base
+                    else f"the {len(found)} of {base} records that have a number for it")
             totals.append(f"Sum of {field}: {sum_text(found)}, over {over}"
                           + (f"; {len(unread)} could not be read as numbers, such as {_quoted(unread[0])}" if unread
-                             else "") + ".")
+                             else "") + f"{shared}.")
         # Objects found within one another can start on one line: then they are counted as records.
         shared = len({(entry["doc"]["path"], entry["hit"]) for entry in records}) < len(records)
         found = (f"{len(records)} records that hold every word of {_quoted(query)}, on different lines," if by_record
@@ -2673,7 +2881,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                               "pagination is needed to calculate them. Numeric omissions, if any, are stated above. "
                               "Individual records are omitted; find without summary returns them for inspection."])
         if group is not None:
-            return groups_page(scope["title"], key, records, values_of, [*notes, *totals, *numeric,
+            return groups_page(scope["title"], key, records, values_of, places_of, [*notes, *totals, *numeric,
                                                                          *(coverage(matching) if summary else [])],
                                f"{found} in {each}", more, sort, sums, group)
         first = min(page_at(key, more) or 0, len(records))
@@ -2768,8 +2976,8 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             scope["closing"],
         ])
 
-    def groups_page(title: str, key: str, records: list[dict], values_of, notes: list[str], found: str, more: bool,
-                    sort: list[dict], sums: list[str], group: str) -> str:
+    def groups_page(title: str, key: str, records: list[dict], values_of, places_of, notes: list[str], found: str,
+                    more: bool, sort: list[dict], sums: list[str], group: str) -> str:
         """One line a value of the field instead of the records (core's listedIn): how many records have it, and
         their sums, the largest sum first, or most records first without sum. Asked for the three largest customers
         of a year's invoices, a model would otherwise add up 2,400 rows a customer at a time. `notes` go before the
@@ -2788,7 +2996,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         labels: dict[str, int] = {}
         for member in members.values():
             labels[member["value"]] = labels.get(member["value"], 0) + 1
-        read = [numbers_of(values_of(field)) for field in sums]
+        read = [(numbers_of(values_of(field)), places_of(field)) for field in sums]
         by = sort[0]["field"].lower() if sort else None
         which = (0 if sums else -1) if by is None else next(
             (index for index, field in enumerate(sums) if field.lower() == by), -1)
@@ -2798,13 +3006,18 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             value, indexes = member["value"], member["indexes"]
             if not member["missing"] and member["kind"] in ("string", None) and labels[value] > 1:
                 value = json_records.stringify(value)
-            summed = [[numbers[index] for index in indexes if numbers[index] is not None] for numbers in read]
-            amount = float(len(indexes))
+            # A group's sum adds a value once, as the sum over all the records does.
+            summed = [[numbers[index] for index, kept in zip(indexes, added_once([places[index] for index in indexes]))
+                       if kept and numbers[index] is not None] for numbers, places in read]
+            # An entry and the parts of it the words found too are counted once (core's distinct): a group of a
+            # technician's two entries said "4 records", the first one's details and part beside it (2026-11-16).
+            count = len({records[index].get("outermost", index) for index in indexes})
+            amount = float(count)
             if which >= 0:
                 amount = 0.0
                 for number in summed[which]:
                     amount += number["value"]
-            groups.append({"value": value, "indexes": indexes, "totals": summed, "amount": amount,
+            groups.append({"value": value, "indexes": indexes, "count": count, "totals": summed, "amount": amount,
                            "order": _collation(value)})
 
         def compare(a: dict, b: dict) -> int:
@@ -2828,7 +3041,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             order = order.replace("most", "fewest", 1).replace("largest", "smallest", 1)
 
         def line(row: dict) -> str:
-            count = len(row["indexes"])
+            count = row["count"]
             return (f"- {group}={row['value']}: {count} {'record' if count == 1 else 'records'}" + "".join(
                 f"; {field} = {sum_text(row['totals'][index], False) if row['totals'][index] else '-'}"
                 for index, field in enumerate(sums)))
@@ -2875,6 +3088,156 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             "closing": CONVERSATION_FOUND}, [doc], query, query.split(), args.get("more") is True,
             fields_of(args.get("fields")), sort_of(args.get("sort")), names_in(args.get("sum")),
             group_of(args.get("group")), args.get("summary") is True)
+
+    def conversation_doc(name: str, lines: list[str], partial: bool = False) -> dict:
+        """A conversation's lines as find lists them: each line a record. `partial` when the lines are not all of it
+        (a long one read in part, a message cut): a summary then never says it was read in full."""
+        rows = markdown_rows(lines)
+        heads = {line for header in rows.values() for line in (header["line"], header["line"] + 1)}
+        return {"path": name, "lines": lines, "lower": [line.lower() for line in lines], "table": None, "rows": rows,
+                "heads": heads, "json": False, "line_records": True, "partial": partial}
+
+    def person_whole(conversation_id: str, read: dict, model: str | None) -> dict:
+        """A conversation's timeline with each message of the person's that it cut read whole (core's personWhole).
+        Cut at 4,000 characters, the part number further into a message of about 47 KB was never searched (e11, MiMo
+        eval, 2026-11-15). A message that can't be read whole stays cut, and is said to be."""
+        def whole(event: dict) -> dict:
+            if event["role"] != "user" or not event["truncated"] or event["id"] is None:
+                return event
+            try:
+                return {**event, "text": knowledge.message(conversation_id, event["id"], model), "truncated": False}
+            except Exception:  # noqa: BLE001 - whatever failed, the message stays cut and is said to be
+                return event
+
+        if not any(event["role"] == "user" and event["truncated"] for event in read["events"]):
+            return read
+        with ThreadPoolExecutor(max_workers=READ_AT_ONCE) as pool:
+            return {**read, "events": list(pool.map(whole, read["events"]))}
+
+    def find_in_linked(session: str, which: str, args: dict) -> str:
+        """find_in_conversation in a conversation added here, by its name, or in this one and every added one
+        together ("all"), as one list (core's findInLinked): what the person wrote in an added one is read from
+        AdaptiqAI's timeline of it, a message the timeline cut read whole. Only a conversation added here is read;
+        what is still cut or left out is said under the page's first line, so a miss there never reads as not
+        written."""
+        conversation = conversation_of(session)
+        view = knowledge.conversation_view(conversation, model_of(session))
+        added = [item for item in view["conversations"] if item["conversation_id"] != conversation]
+        # "all", unless a conversation added here is called so, which is then the one meant (core's meansAll).
+        everything = same_name(which) == "all" and not any(same_name(item["name"]) == "all" for item in added)
+        if everything:
+            chosen = added
+        else:
+            if not added:
+                _fail(f"No conversation is added here, so none is called {_quoted(which)}. find_in_conversation "
+                      "without conversation finds in this one.")
+            wanted = same_name(which)
+            exact = [item for item in added if same_name(item["name"]) == wanted]
+            partial = [item for item in added if wanted and wanted in same_name(item["name"])]
+            if len(exact) > 1:
+                _fail(f"{len(exact)} conversations added here are called {_quoted(which)}. Use \"all\" to find in "
+                      "them together.")
+            if not exact and len(partial) > 1:
+                _fail(f"Several conversations added here match {_quoted(which)}: {_names(partial)}. Name one as status "
+                      "shows it.")
+            if not exact and not partial:
+                _fail(f"No conversation added here is called {_quoted(which)}. Added here: {_names(added)}.")
+            chosen = exact or partial
+        docs, versions, notes = [], [], []
+        if everything:
+            try:
+                written = written_of(session)
+            except Exception:  # noqa: BLE001 - whatever failed, the messages were not read
+                _fail(CONVERSATION_UNREAD)
+            if written is None:
+                _fail(CONVERSATION_UNHELD)
+            own = written_lines(written)
+            docs.append(conversation_doc(THIS_CONVERSATION, own))
+            versions.append(hashlib.sha256(json_records.stringify(own).encode("utf-8", "surrogatepass")).hexdigest())
+            if not added:
+                notes.append("No other conversation is added here, so this is this conversation alone.")
+        for item in chosen:
+            name = _quoted(item["name"])
+            try:
+                read = person_whole(item["conversation_id"], knowledge.timeline(item["conversation_id"], model_of(session)),
+                                    model_of(session))
+            except knowledge.KnowledgeError as error:
+                notes.append(f"{name} could not be read just now; this does not mean it holds nothing. Do not search "
+                             "it again in this turn: tell the person it could not be read right now, and that they "
+                             "can ask again shortly." if error.passing else
+                             f"AdaptiqAI refused to read {name}{f' ({error.answer})' if error.answer else ''}. This "
+                             "does not mean it holds nothing; tell the person once, with that answer.")
+                continue
+            said = [event for event in read["events"] if event["role"] == "user"]
+            cut = [event for event in said if event["truncated"]]
+            if cut:
+                shown = max(len(event["text"]) for event in cut)
+                longest = max(event["bytes"] or 0 for event in cut)
+                notes.append(f"{name}: {len(cut)} of the person's {len(said)} messages there come cut by AdaptiqAI at "
+                             f"{shown:,} characters{f' (the longest has {longest:,} bytes)' if longest > shown else ''}"
+                             ", so what stands past that was not searched: a miss there does not mean it was not "
+                             "written.")
+            events = len(read["events"])
+            of = f" of {read['count']}" if read["count"] is not None and read["count"] > events else ""
+            if read["left"] == "after":
+                notes.append(f"{name}: its first {events}{of} messages were read, so what was said after them was not "
+                             "searched.")
+            if read["left"] == "before":
+                notes.append(f"{name}: only its latest {events}{of} messages could be read, so what was said before "
+                             "them was not searched.")
+            docs.append(conversation_doc(f"{name} (added)", written_lines([event["text"] for event in said]),
+                                         bool(cut) or read["left"] is not None))
+            last = read["latest"] if read["latest"] is not None else (read["events"][-1]["seq"] if read["events"] else -1)
+            versions.append(f"{item['conversation_id']} {last} "
+                            f"{read['count'] if read['count'] is not None else len(read['events'])}")
+        if not everything and not docs:
+            _fail("\n".join(notes))
+        page = conversations_page(session, docs, "\n".join(versions), args)
+        if not notes:
+            return page
+        first, *rest = page.split("\n")
+        return "\n".join([first, *notes, *rest])
+
+    def with_unsearched(session: str, page: str) -> str:
+        """A find in this conversation alone, with the conversations added here that it did not search named under
+        its first line (core's withUnsearched). Told "1 lines …, all of them", their own question, agents said the
+        meeting was never shared here, or counted one mention (MiMo eval, 2026-11-15)."""
+        try:
+            conversation = conversation_of(session)
+            view = knowledge.conversation_view(conversation, model_of(session))
+        except knowledge.KnowledgeError:
+            return page
+        note = unsearched_note([item["name"] for item in view["conversations"]
+                                if item["conversation_id"] != conversation])
+        if not note:
+            return page
+        first, *rest = page.split("\n")
+        return "\n".join([first, *note, *rest])
+
+    def conversations_page(session: str, docs: list[dict], version: str, args: dict) -> str:
+        """One page of every line of the conversations given that holds the words, as one list (core's
+        listConversations)."""
+        one = len(docs) == 1
+        alone = one and docs[0]["path"] == THIS_CONVERSATION
+        what = docs[0]["path"] if one else "these conversations"
+        title = what[:1].upper() + what[1:]
+        query = str(args.get("query") or "").strip()[:120]
+        if not query:
+            _fail(f"Say which words to find in {what}.")
+        if all(not doc["lines"] for doc in docs):
+            _fail(f"{title} {'has' if one else 'have'} no messages to find in yet.")
+        return records_page({
+            "title": title,
+            # An added conversation's lines are AdaptiqAI's, not the harness's own: where from is not said of them.
+            "coverage": CONVERSATION_SCANNED if alone else (f"Sources scanned: {what if one else f'{len(docs)} conversations'}"
+                                                             ". Other conversations and collections are not included."),
+            "key": "\n".join([session, "conversation", version, *(doc["path"] for doc in docs)]),
+            "wanted": "", "documents": [], "first_chars": 0,
+            "again": "the same words and more: true" if alone else "the same words, conversation and more: true",
+            "miss": lambda where, words: f"No line of {what} holds {_quoted(words)}.",
+            "closing": CONVERSATION_FOUND if alone else f"These are the exact lines of {what}."},
+            docs, query, query.split(), args.get("more") is True, fields_of(args.get("fields")), sort_of(args.get("sort")),
+            names_in(args.get("sum")), group_of(args.get("group")), args.get("summary") is True)
 
     def find(session: str, model: str, view: dict, args: dict) -> str:
         query = str(args.get("query") or "").strip()[:120]
@@ -2927,11 +3290,18 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 return found
 
             pattern = f"(?i){_literal(query)}"
-            found = lookup(pattern)
+            # A phrase that is longer than the pattern AdaptiqAI's search takes, once its marks are escaped, is
+            # refused (400, with 77 marks in a query of 120 characters): its words are searched instead.
+            found = (lookup(pattern) if len(words) == 1 or len(pattern) <= PATTERN_CHARS
+                     else {"matches": [], "truncated": False})
+            # The words the lines found hold when AdaptiqAI's search takes only the longest of them at once, and
+            # those it left out.
+            searched, left = words, []
             if not found["matches"] and len(words) > 1:
-                pattern = "(?i)" + "".join(f"(?=.*{_literal(word)})" for word in words)
+                pattern, searched, left = _all_words(words)
                 found = lookup(pattern)
             if not found["matches"]:
+                # No line holds even the words searched, so none holds them all.
                 lines.append(f"No line of {_quoted(item['name'])}{'' if document is None else f' in {document}'} holds "
                              f"{_quoted(query)}.")
                 # Where an id among the words stands alone: searching an employee's id with "name employee
@@ -2950,7 +3320,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 continue
             found_any = True
             lines.append(f"{_quoted(item['name'])}: {'the first ' if found['truncated'] else ''}"
-                         f"{len(found['matches'])} lines with {_quoted(query)}:")
+                         f"{len(found['matches'])} lines with "
+                         f"{_quoted(' '.join(searched) if left else query)}:")
+            if left:
+                lines.append(f"AdaptiqAI's search takes a pattern of {PATTERN_CHARS} characters, which holds these "
+                             f"words of {_quoted(query)} and not {_quoted(' '.join(left))}: a line here may lack "
+                             "those.")
             tables = tables_of(model, item, found["matches"])
             matches = [_as_written(match, tables.get(match["path"])) for match in found["matches"]]
             records = knowledge.records(model, item["memory_id"], matches)
@@ -3022,6 +3397,15 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             lines.append(FOUND)
         elif not hinted:
             lines.append(NOTHING_FOUND)
+        if not found_any:
+            # What find did not search: the conversations added here.
+            try:
+                here = conversation_of(session)
+            except knowledge.KnowledgeError:
+                here = None
+            if here is not None:
+                lines += not_searched_by_find([item["name"] for item in view.get("conversations") or []
+                                               if item["conversation_id"] != here])
         return "\n".join(lines)
 
     def tables_of(model: str, item: dict, matches: list[dict]) -> dict[str, dict]:
@@ -3355,8 +3739,13 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             if action not in ("status", "search", "use", "stop", "contents", "find", "open", "find_in_conversation"):
                 _fail("Say what to do: status, search, use, stop, contents, find, open or find_in_conversation.")
             if action == "find_in_conversation":
-                # What the person wrote here, from Hermes' own store: nothing to ask AdaptiqAI.
-                return told(session, action, args, find_in_conversation(session, args), THIS_CONVERSATION)
+                which = str(args.get("conversation") or "").strip()
+                if which:
+                    # One added here is read from AdaptiqAI's timeline of it, beside Hermes' own store for this one.
+                    return told(session, action, args, find_in_linked(session, which, args), which)
+                # What the person wrote here, from Hermes' own store, with the ones added here it did not search.
+                return told(session, action, args, with_unsearched(session, find_in_conversation(session, args)),
+                            THIS_CONVERSATION)
             conversation = conversation_of(session)
             view = knowledge.conversation_view(conversation, model_of(session))
             if action == "status":
@@ -3367,7 +3756,15 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 return search(session, conversation, model, view, args, selected)
             # Each read says when it was asked again and nothing is new.
             if action in ("contents", "find", "open"):
-                return told(session, action, args, read(session, conversation, model, view, selected, args))
+                if action != "find" or not str(args.get("conversation") or "").strip():
+                    return told(session, action, args, read(session, conversation, model, view, selected, args))
+                # What conversation is for comes first, whatever find answers (core's tools.ts).
+                try:
+                    page = read(session, conversation, model, view, selected, args)
+                except knowledge.KnowledgeError as error:
+                    error.args = (f"{CONVERSATION_NOT_FOR_FIND}\n{error}", *error.args[1:])
+                    raise
+                return told(session, action, args, f"{CONVERSATION_NOT_FOR_FIND}\n{page}")
             use = action == "use"
             item = named(model, view, str(args.get("name") or ""), not use, selected)
             if (item["memory_id"] in selected) == use:
