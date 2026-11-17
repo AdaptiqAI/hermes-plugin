@@ -22,10 +22,12 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_HALF_UP, Context, Decimal
 
 from . import adaptiq_core as core
+from . import expression
 from . import json_records
 from . import knowledge
 from . import record
 from . import series
+from . import where as whereof
 
 TOOLSET = "adaptiq"
 
@@ -315,7 +317,8 @@ KNOWLEDGE = {
                        "CSV or TSV table's columns, or the words a number "
                        'stands next to in a sentence (rejected units in "21 rejected units"). Two names with a minus '
                        "between (paid-due) give the days from one date to the other, the minutes from one time to the "
-                       "other (a date with a time of day), or one number less the other."},
+                       "other (a date with a time of day), or one number less the other. len(x), sum(x), min(x) and "
+                       "max(x) count or add up a field that holds a list, and item(x, 3) is its third item."},
             "sum": {"type": "array", "items": {"type": "string"}, "description": "For find with document: fields to "
                     "add up over every record found, on every page (amounts, lengths, quantities, or days between two "
                     "dates written as in fields): exact totals, instead of adding the numbers yourself. For a count or "
@@ -331,6 +334,18 @@ KNOWLEDGE = {
                       "the sums asked for, largest sum first, or most records first without sum (sort: \"count\", or "
                       "a sum field, with desc or asc). Answers which customers, routes or types have the most of "
                       "something in one call."},
+            "where": {"type": "array", "items": {"type": "string"}, "description":
+                      "For find with document: keep only the records that meet every condition (up to 12), each a "
+                      "field, a comparison (<, <=, >, >=, =, !=) and a number, a date, a text in quotes or another "
+                      "field (\"after > upper_limit\", \"beløb >= 10000\", \"status = 'open'\", \"betalt-forfald > 30\"); "
+                      "either side may be arithmetic of fields and numbers (\"total != round(qty * price, 2)\", \"abs(a "
+                      "- b) > 0.5\"), \"customer in ('A', 'B')\" keeps any of those values, and \"note = ''\" the empty "
+                      "ones; \"customer_id in (select customer_id from customers.csv where tariff = 'Night')\" keeps "
+                      "the values another document's records that meet its conditions have, and len, sum, min and max"
+                      " count or add up a field that holds a list (\"len(pumps) > 3\", \"sum(lines.amount)\"). find "
+                      "compares every record found and says how many meet them, also when none does: an exact count, "
+                      "instead of reading every record yourself. With document and no words, find goes through every "
+                      "record."},
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -1001,22 +1016,48 @@ def markdown_rows(lines: list[str]) -> dict[int, dict]:
     return rows
 
 
+def _outside_brackets(text: str) -> list[str]:
+    """A text cut at its commas outside brackets and quotes (core's outsideBrackets): "a, round(b * c, 2)" is two
+    names."""
+    parts: list[str] = []
+    part = ""
+    depth = 0
+    quote = None
+    for char in text:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(part)
+            part = ""
+            continue
+        part += char
+    parts.append(part)
+    return parts
+
+
 def names_in(value) -> list[str]:
     """The names an argument holds, however a model sends them (core's namesIn): a list, a list turned into text (a
     harness makes one of a list where a string is asked for: sort ["afsendt desc"] reached find as
     '["afsendt desc"]', which sorted nothing), or names with commas between, in a list's items too: Hermes turns
-    "parti, dato" sent for a list into a list of that one string. Up to 12."""
+    "parti, dato" sent for a list into a list of that one string; round(total, 2) is one name. Up to 12."""
     items = value
     if isinstance(value, str):
         text = value.strip()
         try:
-            items = json.loads(text) if text.startswith("[") else text.split(",")
+            items = json.loads(text) if text.startswith("[") else _outside_brackets(text)
         except (ValueError, RecursionError):
-            items = re.sub(r"^\[|\]$", "", text).split(",")
+            items = _outside_brackets(re.sub(r"^\[|\]$", "", text))
     if not isinstance(items, list):
         return []
     names = (re.sub(r"""^["']|["']$""", "", part.strip()).strip()
-             for item in items if isinstance(item, str) for part in item.split(","))
+             for item in items if isinstance(item, str) for part in _outside_brackets(item))
     return [name for name in names if name][:12]
 
 
@@ -1782,6 +1823,180 @@ def _records(docs: list[dict], hits: list[list[int]], query: str) -> list[dict]:
             records.append({"doc": doc, "hit": hit, "record": last, "table": table, "typed": None,
                             "read": fields_of_record(start, end, _text_of(doc), table)})
     return records
+
+
+# How many items a list holds before find and open say what it holds: fewer are read at a glance.
+LIST_NOTED = 20
+
+
+def _list_notes(value: dict) -> list[str]:
+    """What the long lists of a record hold, a line each (core's listNotes): how many items, and of numbers the
+    least, the greatest and their sum, worked out here. Asked how many measurements one log entry had, which was
+    the highest and what the 600th was, an agent was shown all 820 in a row to count; every agent that answered
+    wrote them to a file and ran a script over it (2026-11-15)."""
+    notes: list[str] = []
+    for key, held in json_records.entries(value):
+        if not isinstance(held, list) or len(held) <= LIST_NOTED:
+            continue
+        if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in held):
+            notes.append(f"{key}: a list of {len(held):,} items; len({key}) in fields or where counts them.")
+            continue
+        total = 0.0
+        for item in held:
+            total += item
+        notes.append(f"{key}: a list of {len(held):,} numbers, least {expression.number_text(min(held))}, greatest "
+                     f"{expression.number_text(max(held))}, sum {expression.number_text(total)}; item({key}, 3) in "
+                     "fields is the third of them.")
+    return notes
+
+
+def _object_in(lines: list[str], first: int, last: int) -> dict | None:
+    """The object a JSON record's lines write, or None when they are no object alone (one under a key starts with
+    the key)."""
+    try:
+        # Every number a double, as core reads them.
+        value = json.loads(re.sub(r",\Z", "", "\n".join(lines[first - 1:last]).strip(_JS_TRIMMED)), parse_int=float)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _every_hit(doc: dict) -> list[int]:
+    """Every record of a listed document (core's everyHit): each whole JSON object, else each line with text below a
+    table's header."""
+    if "objects" in doc:
+        return json_records.whole_records(doc["objects"])
+    table = doc["table"]
+    return [index + 1 for index, lower in enumerate(doc["lower"])
+            if not ((table is not None and index + 1 <= table["line"]) or index + 1 in doc["heads"]
+                    or lower.strip(_JS_TRIMMED) == "")]
+
+
+def _names_of(entry: dict) -> list[str]:
+    """The fields a record names, as it names them (core's namesOf): a JSON object's keys, a table's columns, a
+    text's words before a colon."""
+    if "names" in entry:
+        return entry["names"]
+    span = (entry["record"]["start"], entry["record"]["end"]) if entry["record"] else (entry["hit"], entry["hit"])
+    return [name for name, _ in pairs_of(*span, _text_of(entry["doc"]), entry["table"])]
+
+
+def _number_in(entry: dict, name: str, places: list | None = None) -> float | None:
+    """A field's number in one record, read as its document writes numbers (core's numberIn). `places` takes where
+    the value stands in its document, or None for one that stands in no one place."""
+    typed = None if entry["typed"] is None else entry["typed"](name)
+    if places is not None:
+        places.append(None if typed is None else typed[2])
+    if typed is not None and typed[1] != "string":
+        return float(typed[0]) if typed[1] == "number" else None
+    text = entry["read"](name)
+    if text is None:
+        return None
+    number = numbers_of([(entry["doc"], entry["table"], text, None)])[0]
+    return None if number is None else number["value"]
+
+
+_LIST_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?\Z")
+
+
+def _list_in(entry: dict, name: str, count: bool):
+    """The numbers of a field's list in one record (a JSON array), each item's own or, after a point, one key of each
+    ("pumper.kw"); for len, how many items (core's listIn). None when the field holds no list, or for sum, min and
+    max an item that is no number."""
+    found = entry.get("object")
+    if found is None:
+        return None
+    head, *path = name.split(".")
+    wanted = head.strip(_JS_TRIMMED).lower()
+    keys = list(found["value"])
+    key = next((key for key in keys if key.lower() == wanted), None)
+    if key is None:
+        key = next((key for key in keys if wanted in key.lower()), None)
+    held = None if key is None else found["value"][key]
+    if not isinstance(held, list):
+        return None
+    items = [functools.reduce(lambda at, step: at.get(step) if isinstance(at, dict) else None, path, item)
+             for item in held]
+    if count:
+        return len(held) if not path else sum(1 for item in items if item is not None)
+    numbers: list[float] = []
+    for item in items:
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            numbers.append(float(item))
+        elif isinstance(item, str) and _LIST_NUMBER.match(item.strip(_JS_TRIMMED)):
+            numbers.append(float(item.strip(_JS_TRIMMED)))
+        else:
+            return None
+    return numbers
+
+
+def _value_at(entry: dict, field: str, expressions: dict) -> tuple[str | None, str | None, str | None]:
+    """A field's value in one record, with its JSON kind and its place: its own, else the arithmetic it writes
+    ("total / hours"), worked out, else none (core's valueAt). The place is where a JSON value stands in its
+    document, when it stands in one place: an entry and a part of it that the words found too read the same value
+    (added_once). `expressions` keeps what each field's text parses to over a find."""
+    typed = None if entry["typed"] is None else entry["typed"](field)
+    own = entry["read"](field) if entry["typed"] is None else None if typed is None else typed[0]
+    if own is not None:
+        return own, None if typed is None else typed[1], None if typed is None else f"{id(entry['doc'])} {typed[2]}"
+    if field not in expressions:
+        expressions[field] = expression.arithmetic_of(field)
+    parsed = expressions[field]
+    if parsed is None:
+        return None, None, None
+    places: list = []
+
+    def listed(name: str, count: bool):
+        places.append(None)
+        return _list_in(entry, name, count)
+
+    result = expression.evaluate(parsed, lambda name: _number_in(entry, name, places), listed)
+    if result is None:
+        return None, None, None
+    return (expression.number_text(result), "number",
+            None if None in places else f"{id(entry['doc'])} {' '.join(places)}")
+
+
+def _every_record(doc: dict, names: list[str]) -> tuple[list[int], list[str]]:
+    """The records a find with no words goes through (core's everyRecord): a JSON document's outermost ones
+    (whole_records), or, when the find names a field none of those has, the outermost objects inside them that have
+    it. Asked which pumps were over 20 kW in a document of stations with their pumps, find compared the three
+    stations, which have no kW, and said none could be compared; so with the lines of orders, and with customers that
+    stand under their ids in one object (2026-11-16). `names` are the fields the find names: fields, sort, sum, group
+    and the left side of each where. The records' places, and the fields named that only objects inside the
+    outermost ones have, which are then the records."""
+    if "objects" not in doc:
+        return _every_hit(doc), []
+    objects = doc["objects"]
+    whole = json_records.whole_records(objects)
+    expressions: dict = {}
+
+    def has_one(entry: dict, wanted: list[str]) -> bool:
+        return any(_value_at(entry, name, expressions)[0] is not None for name in wanted)
+
+    outer = _records([doc], [whole], "")
+    lacked = [name for name in names if not any(has_one(entry, [name]) for entry in outer)]
+    if not lacked:
+        return whole, []
+    places = {found["offset"]: index for index, found in enumerate(objects)}
+
+    def within(index: int, among) -> bool:
+        # Whether an object stands inside one of `among`.
+        at = places.get(objects[index]["parent"])
+        while at is not None:
+            if among(at):
+                return True
+            at = places.get(objects[at]["parent"])
+        return False
+
+    outermost = set(whole)
+    every = _records([doc], [list(range(len(objects)))], "")
+    has = [within(index, outermost.__contains__) and has_one(entry, lacked) for index, entry in enumerate(every)]
+    # Of two objects that have one, one inside the other, the outer is the record.
+    hits = [index for index in range(len(objects)) if has[index] and not within(index, lambda at: has[at])]
+    if not hits:
+        return whole, []
+    return hits, [name for name in lacked if any(has_one(every[index], [name]) for index in hits)]
 
 
 def sorted_records(records: list[dict], sort: list[dict], values_of) -> list[dict]:
@@ -2681,9 +2896,58 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             matches = [match for found in pool.map(own, documents) for match in found]
         return {"matches": matches, "complete": complete}
 
+    def selected(model: str, view: dict, select: dict) -> dict:
+        """The values a select in where reads (core's selected): its field in the records of the documents it names,
+        in any collection used here, that meet its own conditions. Asked for the readings of the customers on one
+        tariff, agents copied ids out of one document a page at a time to name them in another's where
+        (2026-11-14)."""
+        for item in used_here(view, ""):
+            try:
+                documents = documents_of(model, item)
+            except knowledge.KnowledgeError:
+                documents = []
+            files, _, unknown = named_documents(documents, select["document"])
+            if not files:
+                continue
+            if unknown:
+                _fail(f"No document in {_quoted(item['name'])} is called {', '.join(map(_quoted, unknown))}. Name "
+                      "each as contents shows it, with commas between.")
+            if len(files) > LISTED_DOCUMENTS:
+                _fail(f"A select in where reads at most {LISTED_DOCUMENTS} documents; {_quoted(select['document'])} "
+                      f"names {len(files):,} in {_quoted(item['name'])}. Name fewer, with commas between.")
+            reads = read_all(model, item, files)
+            unread = [document["path"] for document, read in zip(files, reads) if read is None or not read["whole"]]
+            if unread:
+                _fail(f"A select in where reads its documents whole; {', '.join(unread)} in {_quoted(item['name'])} "
+                      "can't be read whole (part of a larger source, or not answering just now).")
+            docs = [_listed(document["path"], read) for document, read in zip(files, reads)]
+            asked = [select["field"], *(condition["field"] for condition in select["where"])]
+            found = _records(docs, [_every_record(doc, asked)[0] for doc in docs], "")
+            paths = ", ".join(document["path"] for document in files)
+            if not found:
+                _fail(f"{paths} in {_quoted(item['name'])} holds no records for the select in where.")
+            expressions: dict = {}
+
+            def values_of(field: str, found: list = found, expressions: dict = expressions) -> list[tuple]:
+                return [(entry["doc"], entry["table"], *_value_at(entry, field, expressions)[:2]) for entry in found]
+
+            if all(value is None for _, _, value, _ in values_of(select["field"])):
+                _fail(f"No record of {paths} in {_quoted(item['name'])} has {_quoted(select['field'])}, which the "
+                      f"select in where reads. The fields of the first one: {', '.join(_names_of(found[0]))}.")
+            whereof.keep_where(found, values_of, _names_of, numbers_of, select["where"])
+            return whereof.found_of(values_of(select["field"]))
+        _fail(f"No collection used here has a document called {_quoted(select['document'])}, which the select in "
+              "where reads. Name it as contents shows it.")
+
+    def with_selects(model: str, view: dict, conditions: list[dict]) -> list[dict]:
+        """where's conditions with what each select in them reads (core's withSelects)."""
+        return [{**condition, "found": selected(model, view, condition["select"])} if "select" in condition
+                else condition for condition in conditions]
+
     def listed_in(session: str, model: str, used: list[dict], wanted: str, query: str, words: list[str],
                   more: bool, fields: list[str], sort: list[dict], sums: list[str],
-                  group: str | None, summary: bool = False) -> str | list[str] | None:
+                  group: str | None, summary: bool = False,
+                  conditions: list[dict] | None = None) -> str | list[str] | None:
         """Every line of the named documents that holds the words, each with its record, page by page (core's
         listedIn). The engine's search gives a find its first 25 lines and no more, with a line on each side: asked
         for the lots of one depot in four volumes, an agent saw neither the rest nor which lot a "Depot:" line
@@ -2707,7 +2971,8 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             chars = sum(document.get("chars") or 0 for document in files)
             if len(files) > LISTED_DOCUMENTS and (len(files) > LISTED_SMALL or chars > LISTED_CHARS):
                 # The engine's search still finds lines in them, but no fields, order or sums.
-                if how == "start" and not fields and not sort and not sums and group is None and not summary:
+                if (how == "start" and not fields and not sort and not sums and group is None and not summary
+                        and not conditions):
                     return None
                 _fail(f"{_quoted(wanted)} names {len(files):,} documents in {_quoted(item['name'])}, "
                       f"{format_tokens(chars)} characters; find lists at most {LISTED_DOCUMENTS} together, or up to "
@@ -2734,23 +2999,43 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 "again": "the same words, document and more: true",
                 "miss": lambda where, words: f"No line or record of {where} in {_quoted(item['name'])} holds "
                                              f"{_quoted(words)}.",
-                "closing": FOUND}, docs, query, words, more, fields, sort, sums, group, summary)
+                "closing": FOUND}, docs, query, words, more, fields, sort, sums, group, summary, conditions)
         if "," in wanted:
             _fail(f"No collection used here has the documents {_quoted(wanted)}. Name each as contents shows it, with "
                   "commas between.")
         return None
 
     def records_page(scope: dict, docs: list[dict], query: str, words: list[str], more: bool, fields: list[str],
-                     sort: list[dict], sums: list[str], group: str | None, summary: bool = False) -> str:
+                     sort: list[dict], sums: list[str], group: str | None, summary: bool = False,
+                     conditions: list[dict] | None = None) -> str:
         """A page of the records of `docs` that hold the words, listed, sorted, summed or grouped (core's
         listRecords): a collection's documents, or a conversation's own messages. `scope` says where (core's
         ListingScope): the page's `title`, the `key` its pages are kept under, the documents a find named
         (`wanted`), the collection's `documents` and the first one's characters (`first_chars`), how to ask for more
         (`again`), the sentence when nothing holds the words (`miss(where, words)`), the last line (`closing`) and,
         for a conversation, what a summary says it read (`coverage`). With `summary`, the count and sums of all of
-        them and what was read, without the records."""
+        them and what was read, without the records. With no words, every record; with `conditions` (where), only the
+        records that meet them all, and how many of those found that is."""
+        conditions = conditions or []
+        # With no words, every record: a blank line is none, and of JSON the whole records alone.
+        every = query == ""
+        # How a reply names the words found, or nothing when find went through every record.
+        with_words = "" if every else f" with {_quoted(query)}"
+        scanned = "of every record" if every else f"for {_quoted(query)}"
         lowered = [word.lower() for word in words]
-        hits = [_holding(doc, [query.lower()]) for doc in docs]
+        # The fields this find names (with group, sort names "count" or a sum, no field of its own), and for each
+        # document whose records are objects inside its outermost ones, the fields that made them so.
+        asked = [*fields, *([entry["field"] for entry in sort] if group is None else [group]), *sums,
+                 *(condition["field"] for condition in conditions)]
+        inside: dict[int, tuple[dict, list[str]]] = {}
+
+        def every_of(doc: dict) -> list[int]:
+            found, lacked = _every_record(doc, asked)
+            if lacked:
+                inside[id(doc)] = (doc, lacked)
+            return found
+
+        hits = [every_of(doc) if every else _holding(doc, [query.lower()]) for doc in docs]
         if not any(hits) and len(words) > 1:
             hits = [_holding(doc, lowered) for doc in docs]
         # All the words in one record, on different lines of it: a lot's depot, its type and its date.
@@ -2764,7 +3049,8 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                     if doc["table"] is None and not doc.get("line_records") else [] for doc in docs]
         where = (f"the {len(docs)} documents {_quoted(scope['wanted'])} names" if len(docs) > LISTED_DOCUMENTS
                  else ", ".join(doc["path"] for doc in docs))
-        key = "\n".join([scope["key"], query.lower(), *(f"{entry['field']}\n{entry['descending']}" for entry in sort)])
+        key = "\n".join([scope["key"], query.lower(), *(f"{entry['field']}\n{entry['descending']}" for entry in sort),
+                         *(whereof.conditions_text([condition]) for condition in conditions)])
         total = sum(len(found) for found in hits)
 
         def coverage(count) -> list[str]:
@@ -2790,43 +3076,59 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         if not total:
             page_next(key, None)
             if summary:
-                return "\n".join([f"Complete scan for {_quoted(query)}. Matching records: 0.",
+                return "\n".join([f"Complete scan {scanned}. Matching records: 0.",
                                   *([f"No matching records; sums of {', '.join(map(_quoted, sums))} cannot be "
                                      "evaluated."] if sums else []), *coverage(lambda doc: 0)])
             return "\n".join([scope["miss"](where, query), NOTHING_FOUND])
         records = _records(docs, hits, query)
 
+        expressions: dict = {}
+
         def values_of(field: str) -> list[tuple]:
-            # By record, not by place: sorting reorders the records.
-            values = []
-            for entry in records:
-                typed = None if entry["typed"] is None else entry["typed"](field)
-                values.append((entry["doc"], entry["table"], entry["read"](field) if entry["typed"] is None
-                               else None if typed is None else typed[0], None if typed is None else typed[1]))
-            return values
+            # By record, not by place: sorting reorders the records. A field's own value, else the arithmetic it
+            # writes, worked out.
+            return [(entry["doc"], entry["table"], *_value_at(entry, field, expressions)[:2]) for entry in records]
+
+        # Only the records that meet every condition of where, compared here and not by a model's eye.
+        all_found = len(records)
+        uncompared = 0
+        if conditions:
+            first_found = records[0]
+            asked = whereof.conditions_text(conditions)
+            uncompared = whereof.keep_where(records, values_of, _names_of, numbers_of, conditions)
+            if not records:
+                page_next(key, None)
+                if uncompared == all_found:
+                    return (f"{scope['title']}: none of the {all_found} records{with_words} in {where} could be "
+                            f"compared for {asked}: no record has both sides as numbers, dates or texts to compare. "
+                            f"The fields of the first record are: {', '.join(_names_of(first_found))}.")
+                return (f"{scope['title']}: none of the {all_found} records{with_words} in {where} meets {asked}"
+                        + (f"; {uncompared} of them could not be compared (a field missing, or no number or date on "
+                           "both sides)" if uncompared else "")
+                        + ". Every record found was compared, so this is the answer, not a miss.")
 
         def places_of(field: str) -> list:
             """Where each record's value of a field stands in its document, for a JSON value (core's valueAt): an
             entry and a part of it that the words found too read the same value."""
-            places = []
-            for entry in records:
-                typed = None if entry["typed"] is None else entry["typed"](field)
-                places.append(None if typed is None else f"{id(entry['doc'])} {typed[2]}")
-            return places
+            return [_value_at(entry, field, expressions)[2] for entry in records]
 
         # A field no record has is said, with the fields a record has: sorted by a name it does not know, find kept
         # the document's order.
         missing = [field for field in dict.fromkeys([*fields, *(entry["field"] for entry in sort), *sums,
                                                      *([group] if group is not None else [])])
                    if all(value is None for _, _, value, _ in values_of(field))]
-        head = records[0]
-        span = (head["record"]["start"], head["record"]["end"]) if head["record"] else (head["hit"], head["hit"])
-        named = head["names"] if "names" in head else [name for name, _ in pairs_of(*span, _text_of(head["doc"]),
-                                                                                     head["table"])]
+        named = _names_of(records[0])
         minus = " (a-b is the days between two dates, the minutes between two times, or one number less another)"
-        notes = ([f"No record found here has {' or '.join(map(_quoted, missing))}"
-                  f"{minus if any('-' in field for field in missing) else ''}. The fields of the first one: "
-                  f"{', '.join(named) if named else 'none find can name'}."] if missing else [])
+        # Which objects the records are is said, where they are not the outermost ones.
+        lacked = list(dict.fromkeys(name for _, names in inside.values() for name in names))
+        inner = (where if len(inside) == len(docs)
+                 else ", ".join(doc["path"] for doc, _ in list(inside.values())[:LISTED_DOCUMENTS]))
+        notes = [*([f"No outermost record of {inner} has {' or '.join(map(_quoted, lacked))}: the records here are "
+                    f"the objects inside them that have {'it' if len(lacked) == 1 else 'one of them'}."]
+                   if inside else []),
+                 *([f"No record found here has {' or '.join(map(_quoted, missing))}"
+                    f"{minus if any('-' in field for field in missing) else ''}. The fields of the first one: "
+                    f"{', '.join(named) if named else 'none find can name'}."] if missing else [])]
         if sort:
             records = sorted_records(records, sort, values_of)
         totals = []
@@ -2861,8 +3163,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                              else "") + f"{shared}.")
         # Objects found within one another can start on one line: then they are counted as records.
         shared = len({(entry["doc"]["path"], entry["hit"]) for entry in records}) < len(records)
-        found = (f"{len(records)} records that hold every word of {_quoted(query)}, on different lines," if by_record
-                 else f"{len(records)} records with {_quoted(query)}" if shared
+        found = (f"{len(records)} of the {all_found} records{with_words} that meet "
+                 f"{whereof.conditions_text(conditions)}"
+                 f"{f' ({uncompared} could not be compared)' if uncompared else ''}" if conditions
+                 else f"{len(records)} records that hold every word of {_quoted(query)}, on different lines,"
+                 if by_record
+                 else f"{len(records)} records{with_words}" if shared or every
                  else f"{total} lines with {_quoted(query)}" if total == len(records)
                  else f"{total} lines in {len(records)} records with {_quoted(query)}")
         each = (docs[0]["path"] if len(docs) == 1
@@ -2875,7 +3181,11 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             return sum(1 for entry in records if entry["doc"] is doc)
 
         if summary and group is None:
-            return "\n".join([f"Complete scan for {_quoted(query)}. Matching records: {len(records)}.", *notes,
+            of_all = (f" of {all_found}{f' ({uncompared} could not be compared)' if uncompared else ''}"
+                      if conditions else "")
+            return "\n".join([f"Complete scan {scanned}"
+                              f"{f' where {whereof.conditions_text(conditions)}' if conditions else ''}. "
+                              f"Matching records: {len(records)}{of_all}.", *notes,
                               *totals, *numeric, *coverage(matching),
                               "The count and sums above already cover every matching record in this scope. No record "
                               "pagination is needed to calculate them. Numeric omissions, if any, are stated above. "
@@ -2883,12 +3193,12 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         if group is not None:
             return groups_page(scope["title"], key, records, values_of, places_of, [*notes, *totals, *numeric,
                                                                          *(coverage(matching) if summary else [])],
-                               f"{found} in {each}", more, sort, sums, group)
+                               f"{found} in {each}", more, sort, sums, group, bool(conditions))
         first = min(page_at(key, more) or 0, len(records))
         if first == len(records):
             # Kept at the end: asked on again, find says so again instead of starting from the first record.
             page_next(key, first)
-            return (f"All {len(records)} records with {_quoted(query)} in {where} were shown already. find without "
+            return (f"All {len(records)} records{with_words} in {where} were shown already. find without "
                     "more: true starts again from the first.")
         body: list[str] = []
         # The tables whose columns the page shows, once each, before their first row.
@@ -2902,10 +3212,13 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             # A JSON record that is part of its line is shown as itself, never as the line (core's listRecords): one
             # node of a network model written on one line of 148,362 characters was never shown (2026-11-14).
             found_object = entry.get("object")
-            alone = (json.dumps(found_object["value"], ensure_ascii=False, separators=(",", ":"))
+            # Written as JavaScript writes it (core's JSON.stringify): Python's own writer ends every whole number
+            # in ".0", as each number is read as a double.
+            alone = (json_records.stringify(found_object["value"])
                      if found_object is not None and found_object["start"] == found_object["end"] else None)
             matched = alone if alone is not None and len(alone) < len(text(hit).strip()) else text(hit)
-            rows = [field_line(doc["path"], hit, around, text, fields, table, entry["read"]) if fields
+            rows = [field_line(doc["path"], hit, around, text, fields, table,
+                               lambda field, entry=entry: _value_at(entry, field, expressions)[0]) if fields
                     else f"- {doc['path']}:{hit}: {f'{matched[:LINE_CHARS]}…' if len(matched) > LINE_CHARS else matched}"]
             if table is not None and not fields and id(table) not in shown_tables:
                 shown_tables.add(id(table))
@@ -2929,6 +3242,9 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                 rows.append(f"  The whole record, lines {around['start']}-{end}:" if whole
                             else f"  Lines {around['start']}-{end} of its record (long lines may be shortened):")
                 rows += excerpt
+            # What its long lists hold, counted here: the line shows only where such a list starts.
+            if not fields and found_object is not None:
+                rows += [f"  {note}" for note in _list_notes(found_object["value"])]
             size = sum(len(row) + 1 for row in rows)
             if after > first and (size > room or (sort and after - first >= SORTED_PAGE)):
                 break
@@ -2967,7 +3283,9 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             *(["The sums already include every matching record, including records not displayed below. More only "
                "pages individual records; it does not add to these totals."] if sums else []),
             *body,
-            (f"More: find again with {scope['again']} for records {after + 1}-{len(records)}."
+            (f"More: find again with "
+             f"{scope['again'].replace(' and more: true', ', where and more: true') if conditions else scope['again']}"
+             f" for records {after + 1}-{len(records)}."
              + (f" To go through many records at once, name the fields you need (fields{columns}), and each record "
                 "takes one line." if not fields and len(records) - after > 40 else ""))
             if after < len(records) else "That is the last of them.",
@@ -2977,7 +3295,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
         ])
 
     def groups_page(title: str, key: str, records: list[dict], values_of, places_of, notes: list[str], found: str,
-                    more: bool, sort: list[dict], sums: list[str], group: str) -> str:
+                    more: bool, sort: list[dict], sums: list[str], group: str, filtered: bool = False) -> str:
         """One line a value of the field instead of the records (core's listedIn): how many records have it, and
         their sums, the largest sum first, or most records first without sum. Asked for the three largest customers
         of a year's invoices, a model would otherwise add up 2,400 rows a customer at a time. `notes` go before the
@@ -3050,7 +3368,8 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             f"{title}: {found}, all of them, in {len(groups)} groups by {group}, {order}. Groups "
             f"{first + 1}-{first + len(page)} of {len(groups)}:",
             *notes, *map(line, page),
-            f"More: find again with the same words, document, group and more: true for groups "
+            f"More: find again with the same words, document, group{', where' if filtered else ''} and more: true "
+            f"for groups "
             f"{first + len(page) + 1}-{len(groups)}." if first + len(page) < len(groups) else "That is the last of them.",
             "The counts and sums already include all matching records; more only pages the group list. For an "
             "optional inspection of one group's records, find with its value among the words, without group or "
@@ -3087,7 +3406,7 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             "miss": lambda where, words: f"No line of {THIS_CONVERSATION} holds {_quoted(words)}.",
             "closing": CONVERSATION_FOUND}, [doc], query, query.split(), args.get("more") is True,
             fields_of(args.get("fields")), sort_of(args.get("sort")), names_in(args.get("sum")),
-            group_of(args.get("group")), args.get("summary") is True)
+            group_of(args.get("group")), args.get("summary") is True, whereof.where_of(args.get("where")))
 
     def conversation_doc(name: str, lines: list[str], partial: bool = False) -> dict:
         """A conversation's lines as find lists them: each line a record. `partial` when the lines are not all of it
@@ -3237,30 +3556,37 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
             "miss": lambda where, words: f"No line of {what} holds {_quoted(words)}.",
             "closing": CONVERSATION_FOUND if alone else f"These are the exact lines of {what}."},
             docs, query, query.split(), args.get("more") is True, fields_of(args.get("fields")), sort_of(args.get("sort")),
-            names_in(args.get("sum")), group_of(args.get("group")), args.get("summary") is True)
+            names_in(args.get("sum")), group_of(args.get("group")), args.get("summary") is True,
+            whereof.where_of(args.get("where")))
 
     def find(session: str, model: str, view: dict, args: dict) -> str:
         query = str(args.get("query") or "").strip()[:120]
         document = args.get("document") if isinstance(args.get("document"), str) else None
         named = document is not None and document.strip() != ""
-        # Asked for every record of a document with no words, an agent got only "Say which words" and had to guess
-        # one.
-        if not query:
-            _fail("Say which words to find. To go through every record of a document, find a word or a field name "
-                  "each record holds (with fields, sort and sum as needed)." if named else "Say which words to find.")
-        words = query.split()
-        used = used_here(view, str(args.get("name") or ""))
         fields, sort, sums = fields_of(args.get("fields")), sort_of(args.get("sort")), names_in(args.get("sum"))
         group = group_of(args.get("group"))
         summary = args.get("summary") is True
+        conditions = whereof.where_of(args.get("where"))
+        # Asked for every record of a document with no words, agents got only "Say which words" and scanned for a
+        # word they guessed (2026-11-14): a document and something to do with its records go through every record.
+        # A document named and nothing more lists its records, page by page (core's find).
+        every = not query and named
+        if not query and not every:
+            _fail("Say which words to find.")
+        words = query.split()
+        used = used_here(view, str(args.get("name") or ""))
         paths: list[str | None] = [document]
         if named:
             listed = listed_in(session, model, used, document.strip(), query, words, args.get("more") is True,
-                               fields, sort, sums, group, summary)
+                               fields, sort, sums, group, summary, with_selects(model, view, conditions))
             if isinstance(listed, str):
                 return listed
             if listed is not None:
                 paths = listed
+        # The engine's search needs words: every record is only for documents find reads whole.
+        if every:
+            _fail(f"find goes through every record only of documents it reads whole; {document.strip()} is not one "
+                  "of them. Say which words to find in it.")
         # The engine's search gives at most its first lines: never a complete count or sum.
         if summary:
             _fail("summary requires named documents that find can read in full. No complete count or sum was "
@@ -3268,11 +3594,11 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                   "complete total.")
         lines = []
         # The engine's search gives lines: it knows no fields, order or sums.
-        if fields or sort or sums or group is not None:
-            lines.append(f"fields, sort, sum and group work on documents find reads whole; {document.strip()} is "
-                         "searched by the engine instead, so these are its results, as lines." if named else
-                         "fields, sort, sum and group work when document names the documents to look in; without it, "
-                         "these are the engine's search results, as lines.")
+        if fields or sort or sums or group is not None or conditions:
+            lines.append(f"fields, sort, sum, group and where work on documents find reads whole; {document.strip()} "
+                         "is searched by the engine instead, so these are its results, as lines." if named else
+                         "fields, sort, sum, group and where work when document names the documents to look in; "
+                         "without it, these are the engine's search results, as lines.")
         room = knowledge.RECORD_CHARS
         found_any = False
         # A miss that shows where an id stands alone ends on those lines, not on "nothing was found".
@@ -3661,6 +3987,10 @@ def handlers(model_of, remember_of, set_remember, conversation_of=lambda session
                     where = "in the list" if listed["key"] == "" else f'in "{listed["key"]}"'
                     count = f" of {listed['count']:,}" if read["whole"] else ""
                     place.append(f"Record {listed['index']:,}{count} {where} at line {listed['line']}.")
+                # What its long lists hold, counted here: 820 numbers in a row are not counted by eye.
+                held = _object_in(lines, found_record["first"], found_record["last"])
+                if held is not None:
+                    place += _list_notes(held)
             elif header is not None and line > header["line"]:
                 top = bottom = line
                 if rows is not None:

@@ -155,6 +155,34 @@ def _validate(source: str, path: str) -> None:
                 raise ValueError("Invalid JSON Lines record") from None
 
 
+def whole_records(records: list[dict]) -> list[int]:
+    """The records a find with no words goes through, by their places (core's wholeRecords): the outermost ones.
+    Where a document holds several objects at the top (JSON Lines, or a list), those; where one object stands around
+    its lists, the items of the lists in it that stand in no other item. Never an object under a key of another (a
+    log entry's details are part of the entry), nor an item of a list a record holds (a station's pumps are part of
+    the station)."""
+    tops = [index for index, entry in enumerate(records) if entry["parent"] is None]
+    if len(tops) != 1:
+        return tops
+    by_offset = {entry["offset"]: entry for entry in records}
+
+    def item(entry: dict) -> bool:
+        # A list's item: it stands under no key, in another object.
+        return entry["key"] == "" and entry["parent"] is not None
+
+    def in_item(entry: dict) -> bool:
+        at = by_offset.get(entry["parent"])
+        while at is not None:
+            if item(at):
+                return True
+            at = by_offset.get(at["parent"])
+        return False
+
+    items = [index for index, entry in enumerate(records) if item(entry) and not in_item(entry)]
+    # One object with no list of objects in it is the record itself.
+    return items or tops
+
+
 def json_records(lines: list[str], path: str) -> list[dict]:
     """A JSON document's objects, each a record: its first and last line, where it starts, its value, and the text a
     find searches (core's jsonRecords): the key it stands under, its own fields that are no object (a parent never

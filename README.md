@@ -158,9 +158,11 @@ works with that model only, so the agent searches the store of the model the con
   page by page; words that stand on different lines of one record find the records that hold them all. `fields`
   shows only the fields asked for, one record a line (`paid-due` gives the days between two dates, and a text's
   field may be the words a number stands next to in a sentence: "21 rejected units"); `sort` orders
-  the records of all the documents together; `sum` adds fields up over every record found; and `group` gives one
-  line a value, with its count and sums. A CSV or TSV is read from its original, so its cells and decimal commas
-  are as written. It searches the library by collection name, and starts or
+  the records of all the documents together; `sum` adds fields up over every record found; `group` gives one
+  line a value, with its count and sums; and `where` keeps only the records that meet every condition
+  (`beloeb != round(antal * stykpris, 2)`, `kunde in ('K-007', 'K-012')`, or a field in the values another
+  document's records have), with an exact count. With a document and no words it goes through every record. A CSV
+  or TSV is read from its original, so its cells and decimal commas are as written. It searches the library by collection name, and starts or
   stops using a collection by its name, which applies from the next reply; asked to use one that could not be built,
   it says why (a full workspace: how much is taken and how much it needs). A turn is told which ready collections
   its conversation reads, once and again when they change, so the agent looks things up there. status names the
