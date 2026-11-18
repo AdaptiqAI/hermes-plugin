@@ -1620,18 +1620,24 @@ CONVERSATION_FIND_INSTRUCTIONS = (
     "use adaptiq_knowledge, action find_in_conversation, with the words to look for, and answer from the lines it "
     "returns. A long conversation is read in parts, so never count from what you remember of it.")
 INSTRUCTIONS = (KNOWLEDGE_INSTRUCTIONS, CONVERSATION_FIND_INSTRUCTIONS)
+# Told last, in a new conversation's system prompt only: where saved knowledge, a reply and a local file stay.
+# Asked to make something for the person, agents saved it as knowledge or wrote a file and called it done.
+WHERE_THINGS_STAY = (
+    "AdaptiqAI knowledge is your memory, not one of the person's apps. What is saved there stays there, a reply "
+    "stays in this conversation, and a file written on this machine stays on this machine: none of them appears "
+    "in the person's documents, messages, calendar or other records kept in their apps.")
 
 
 def _system_prompt_section(info) -> str:
     """The plugin's section of a new session's system prompt (Hermes freezes it for the session): the knowledge
-    instructions, on an AdaptiqAI model while the knowledge tool is offered; nothing elsewhere. A conversation
+    instructions and where things stay, on an AdaptiqAI model while the knowledge tool is offered; nothing elsewhere. A conversation
     that gets them later, on its first turn on AdaptiqAI, is told them in that turn instead."""
     model = str(info.get("model") or "")
     if not model or model not in _adaptiq_models() or not tools.available():
         return ""
     if info.get("session_id"):
         _told(str(info["session_id"]))
-    return "\n\n".join(INSTRUCTIONS)
+    return "\n\n".join((*INSTRUCTIONS, WHERE_THINGS_STAY))
 
 
 def register(ctx) -> None:
